@@ -43,7 +43,8 @@ macro_rules! for_all_classified_sources {
                 { Azblob, $crate::source::filesystem::opendal_source::AzblobProperties, $crate::source::filesystem::OpendalFsSplit<$crate::source::filesystem::opendal_source::OpendalAzblob> },
                 { Test, $crate::source::test_source::TestSourceProperties, $crate::source::test_source::TestSourceSplit},
                 { Iceberg, $crate::source::iceberg::IcebergProperties, $crate::source::iceberg::IcebergSplit},
-                { AdbcSnowflake, $crate::source::adbc_snowflake::AdbcSnowflakeProperties, $crate::source::adbc_snowflake::AdbcSnowflakeSplit}
+                { AdbcSnowflake, $crate::source::adbc_snowflake::AdbcSnowflakeProperties, $crate::source::adbc_snowflake::AdbcSnowflakeSplit},
+                { MongodbOplog, $crate::source::mongodb_oplog::MongodbOplogProperties, $crate::source::mongodb_oplog::split::MongodbOplogSplit }
             }
             $(
                 ,$extra_args

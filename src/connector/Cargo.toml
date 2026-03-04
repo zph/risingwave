@@ -96,7 +96,7 @@ itertools = { workspace = true }
 jni = { workspace = true }
 maplit = "1.0.2"
 moka = { version = "0.12.10", features = ["future"] }
-mongodb = "3.2.5"
+mongodb = "2.8.2"
 mysql_async = { workspace = true }
 mysql_common = { version = "0.35", default-features = false, features = [
     "chrono",
@@ -218,6 +218,7 @@ workspace-hack = { path = "../workspace-hack" }
 
 [dev-dependencies]
 assert_matches = "1"
+testcontainers = "0.23"
 criterion = { workspace = true, features = ["async_tokio", "async"] }
 deltalake = { workspace = true }
 expect-test = "1"

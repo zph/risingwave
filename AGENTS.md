@@ -65,6 +65,36 @@ When sandboxing is enabled, these commands need `require_escalated` because they
 - `./risedev slt './path/to/e2e-test-file.slt'` (connects to local TCP via psql protocol)
 - Any command that checks running services via local TCP (for example, health checks or custom SQL clients)
 
+## Validating Changes
+
+### Prerequisites
+
+- **Toolchain**: Project requires nightly Rust (see `rust-toolchain.toml`). Use `rustup` (not Homebrew `rust`).
+- **direnv**: `.envrc` prepends `/opt/homebrew/opt/rustup/bin` to PATH so rustup-managed nightly is used.
+
+### Quick Validation Checklist
+
+1. **Compile check** (fastest): `./risedev c` — runs clippy + compile checks
+2. **Build**: `./risedev b` — full build
+3. **Unit tests for a crate**: `cargo test -p risingwave_connector <test_filter>` — run specific tests
+4. **Run instance**: `./risedev d` — starts RisingWave in background (builds if needed, can take ~10 min)
+5. **SQL queries**: `./risedev psql -c "<query>"` — requires running instance
+6. **E2E SLT tests**: `./risedev slt './path/to/test.slt'` — requires running instance
+7. **Stop instance**: `./risedev k`
+
+### Connector-Specific Validation
+
+- **Connector unit tests**: `cargo test -p risingwave_connector mongodb_oplog`
+- **Parser tests**: `./risedev update-parser-test` to regenerate expected output
+- **Planner tests**: `./risedev run-planner-test [name]` to run, `./risedev dapt` to update expected output
+- **Format check**: `cargo fmt` to format code
+
 ## Connector Development
 
 See `docs/dev/src/connector/intro.md`.
+
+### MongoDB Version Requirement
+
+- **Minimum MongoDB server version: 3.6** — this is non-negotiable
+- Use `mongodb` Rust crate **v2.8.2** (v2.x line), NOT v3.x (which drops 3.6 support)
+- All oplog tailing features (tailable cursors, replSetGetStatus, readConcern majority) are available in 3.6+

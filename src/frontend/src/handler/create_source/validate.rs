@@ -104,6 +104,9 @@ static CONNECTORS_COMPATIBLE_FORMATS: LazyLock<HashMap<String, HashMap<Format, V
                 MONGODB_CDC_CONNECTOR => hashmap!(
                     Format::DebeziumMongo => vec![Encode::Json],
                 ),
+                MONGO_OPLOG_CONNECTOR => hashmap!(
+                    Format::DebeziumMongo => vec![Encode::Json],
+                ),
                 NATS_CONNECTOR => hashmap!(
                     Format::Plain => vec![Encode::Json, Encode::Protobuf, Encode::Bytes],
                 ),

@@ -128,6 +128,18 @@ pub struct SourceMetrics {
     pub kinesis_rebuild_shard_iter_count: LabelGuardedIntCounterVec,
     pub kinesis_early_terminate_shard_count: LabelGuardedIntCounterVec,
     pub kinesis_lag_latency_ms: LabelGuardedHistogramVec,
+
+    // mongo-oplog source (OPLOG-022)
+    pub oplog_entries_read_total: LabelGuardedIntCounterVec,
+    pub oplog_entries_released_total: LabelGuardedIntCounterVec,
+    pub oplog_entries_discarded_total: LabelGuardedIntCounterVec,
+    pub oplog_buffer_size_bytes: LabelGuardedIntGaugeVec,
+    pub oplog_buffer_entries: LabelGuardedIntGaugeVec,
+    pub oplog_high_watermark_ts: LabelGuardedIntGaugeVec,
+    pub oplog_tail_ts: LabelGuardedIntGaugeVec,
+    pub oplog_lag_seconds: LabelGuardedIntGaugeVec,
+    pub oplog_rollbacks_total: LabelGuardedIntCounterVec,
+    pub oplog_reconnects_total: LabelGuardedIntCounterVec,
 }
 
 pub static GLOBAL_SOURCE_METRICS: LazyLock<SourceMetrics> =
@@ -250,6 +262,86 @@ impl SourceMetrics {
         )
         .unwrap();
 
+        let oplog_entries_read_total = register_guarded_int_counter_vec_with_registry!(
+            "oplog_entries_read_total",
+            "Total oplog entries read from cursor",
+            &["source_id", "source_name", "fragment_id", "split_id"],
+            registry
+        )
+        .unwrap();
+
+        let oplog_entries_released_total = register_guarded_int_counter_vec_with_registry!(
+            "oplog_entries_released_total",
+            "Total entries released downstream after watermark check",
+            &["source_id", "source_name", "fragment_id", "split_id"],
+            registry
+        )
+        .unwrap();
+
+        let oplog_entries_discarded_total = register_guarded_int_counter_vec_with_registry!(
+            "oplog_entries_discarded_total",
+            "Total entries discarded due to rollback or reconnect",
+            &["source_id", "source_name", "fragment_id", "split_id"],
+            registry
+        )
+        .unwrap();
+
+        let oplog_buffer_size_bytes = register_guarded_int_gauge_vec_with_registry!(
+            "oplog_buffer_size_bytes",
+            "Current oplog buffer size in bytes",
+            &["source_id", "source_name", "fragment_id", "split_id"],
+            registry
+        )
+        .unwrap();
+
+        let oplog_buffer_entries = register_guarded_int_gauge_vec_with_registry!(
+            "oplog_buffer_entries",
+            "Current number of buffered oplog entries",
+            &["source_id", "source_name", "fragment_id", "split_id"],
+            registry
+        )
+        .unwrap();
+
+        let oplog_high_watermark_ts = register_guarded_int_gauge_vec_with_registry!(
+            "oplog_high_watermark_ts",
+            "Current majority commit point timestamp seconds",
+            &["source_id", "source_name", "fragment_id", "split_id"],
+            registry
+        )
+        .unwrap();
+
+        let oplog_tail_ts = register_guarded_int_gauge_vec_with_registry!(
+            "oplog_tail_ts",
+            "Timestamp of most recent oplog entry read",
+            &["source_id", "source_name", "fragment_id", "split_id"],
+            registry
+        )
+        .unwrap();
+
+        let oplog_lag_seconds = register_guarded_int_gauge_vec_with_registry!(
+            "oplog_lag_seconds",
+            "Lag between tail position and high watermark in seconds",
+            &["source_id", "source_name", "fragment_id", "split_id"],
+            registry
+        )
+        .unwrap();
+
+        let oplog_rollbacks_total = register_guarded_int_counter_vec_with_registry!(
+            "oplog_rollbacks_total",
+            "Total rollback events detected",
+            &["source_id", "source_name", "fragment_id", "split_id"],
+            registry
+        )
+        .unwrap();
+
+        let oplog_reconnects_total = register_guarded_int_counter_vec_with_registry!(
+            "oplog_reconnects_total",
+            "Total MongoDB reconnection events",
+            &["source_id", "source_name", "fragment_id", "split_id"],
+            registry
+        )
+        .unwrap();
+
         SourceMetrics {
             partition_input_count,
             partition_input_bytes,
@@ -266,6 +358,17 @@ impl SourceMetrics {
             kinesis_rebuild_shard_iter_count,
             kinesis_early_terminate_shard_count,
             kinesis_lag_latency_ms,
+
+            oplog_entries_read_total,
+            oplog_entries_released_total,
+            oplog_entries_discarded_total,
+            oplog_buffer_size_bytes,
+            oplog_buffer_entries,
+            oplog_high_watermark_ts,
+            oplog_tail_ts,
+            oplog_lag_seconds,
+            oplog_rollbacks_total,
+            oplog_reconnects_total,
         }
     }
 }

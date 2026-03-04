@@ -22,6 +22,7 @@ pub mod prelude {
     pub use crate::source::kafka::KafkaSplitEnumerator;
     pub use crate::source::kinesis::KinesisSplitEnumerator;
     pub use crate::source::mqtt::MqttSplitEnumerator;
+    pub use crate::source::mongodb_oplog::enumerator::MongodbOplogSplitEnumerator;
     pub use crate::source::nats::NatsSplitEnumerator;
     pub use crate::source::nexmark::NexmarkSplitEnumerator;
     pub use crate::source::pulsar::PulsarSplitEnumerator;
@@ -53,6 +54,7 @@ pub mod google_pubsub;
 pub mod kafka;
 pub mod kinesis;
 pub mod monitor;
+pub mod mongodb_oplog;
 pub mod mqtt;
 pub mod nats;
 pub mod nexmark;
@@ -70,6 +72,7 @@ pub use google_pubsub::GOOGLE_PUBSUB_CONNECTOR;
 pub use kafka::KAFKA_CONNECTOR;
 pub use kinesis::KINESIS_CONNECTOR;
 pub use mqtt::MQTT_CONNECTOR;
+pub use mongodb_oplog::MONGO_OPLOG_CONNECTOR;
 pub use nats::NATS_CONNECTOR;
 use utils::feature_gated_source_mod;
 
