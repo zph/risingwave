@@ -959,6 +959,45 @@ Unit test: verify dedup is applied in the sample pipeline. Integration test: ver
 
 ---
 
+**OPLOG-061:** Ubiquitous
+
+**Requirement:**
+The connector SHALL accept a `mongodb.readback.batch_max_count` configuration property (u64, default 128, range 1–4096) that controls the maximum number of `_id` values per batched `$in` read-back query during CDC update processing.
+
+**Rationale:**
+Batched read-back replaces per-update `findOne` calls with a single `find({_id: {$in: [...]}})`, reducing MongoDB round-trips from N to ceil(N / batch_max). The upper bound of 4096 prevents excessive `$in` array sizes that could degrade query plan efficiency.
+
+**Verification:**
+Unit test: verify default is 128. Unit test: verify values outside 1–4096 are rejected by `validate_readback_config()`.
+
+---
+
+**OPLOG-062:** Ubiquitous
+
+**Requirement:**
+The connector SHALL accept a `mongodb.readback.batch_timeout_ms` configuration property (u64, default 50, range 1–5000) that documents the expected batching window for read-back flushes during CDC processing.
+
+**Rationale:**
+The watermark release loop already provides natural batching; this config documents the expected interval. The range 1–5000 prevents misconfiguration.
+
+**Verification:**
+Unit test: verify default is 50. Unit test: verify values outside 1–5000 are rejected by `validate_readback_config()`.
+
+---
+
+**OPLOG-063:** Event Driven
+
+**Requirement:**
+WHEN durable update entries are released from the watermark buffer, the connector SHALL collect their `_id` values and issue batched `find({_id: {$in: [...]}})` queries (chunked by `readback_batch_max_count`) instead of individual `findOne` calls. The results SHALL be used to look up post-images for each update entry in original order. IDs not found (e.g., deleted between update and read-back) SHALL be logged at warn level and the update SHALL be emitted without a post-image.
+
+**Rationale:**
+Sequential per-update `findOne` calls become the bottleneck under high update throughput (N updates = N round-trips). Batching reduces this to ceil(N / batch_max) round-trips. Graceful handling of missing IDs avoids pipeline failures when documents are deleted between the oplog entry and the read-back query.
+
+**Verification:**
+Integration test: insert + update multiple docs, verify batched read-back returns all post-images. Integration test: delete a doc before read-back, verify graceful handling with correct count. Unit test: verify `bson_to_key` produces deterministic, type-safe keys.
+
+---
+
 ## Tradeoff Analysis
 
 ### Why Oplog Tailing vs. Change Streams

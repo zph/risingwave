@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -65,6 +65,8 @@ impl SplitReader for MongodbOplogSplitReader {
 
         // OPLOG-047/048: validate snapshot parallelism config
         properties.validate_snapshot_config()?;
+        // OPLOG-061/062: validate readback batching config
+        properties.validate_readback_config()?;
 
         Ok(Self {
             properties,
@@ -1036,6 +1038,8 @@ impl MongodbOplogSplitReader {
         let buffer_max_bytes = self.properties.buffer_max_bytes as usize;
         let heartbeat_interval =
             Duration::from_secs(self.properties.heartbeat_interval_secs);
+        // OPLOG-061: max IDs per batched $in read-back query
+        let readback_batch_max = self.properties.readback_batch_max_count as usize;
 
         // Stall detection state (OPLOG-008a)
         let stall_timeout =
@@ -1249,17 +1253,46 @@ impl MongodbOplogSplitReader {
                             collect_releasable_keys(&buffer, wm_secs, wm_ord);
                         let mut released = Vec::new();
 
+                        // OPLOG-063: collect update _id values for batched read-back
+                        let mut update_ids: Vec<Bson> = Vec::new();
+                        for &(ts_secs, ts_ord) in &keys_to_remove {
+                            if let Some((entry, _)) = buffer.get(&(ts_secs, ts_ord)) {
+                                if entry.get_str("op").unwrap_or("n") == "u" {
+                                    if let Ok(o2) = entry.get_document("o2") {
+                                        if let Some(id) = o2.get("_id") {
+                                            update_ids.push(id.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Batched read-back: single find({_id:{$in:[...]}}) per chunk
+                        let post_images = if !update_ids.is_empty() {
+                            Self::batch_read_back_post_images(
+                                &client,
+                                &db_name,
+                                &coll_name,
+                                &update_ids,
+                                readback_batch_max,
+                            )
+                            .await
+                        } else {
+                            HashMap::new()
+                        };
+
                         for &(ts_secs, ts_ord) in &keys_to_remove {
                             if let Some((entry, offset_str)) =
                                 buffer.get(&(ts_secs, ts_ord))
                             {
                                 let op = entry.get_str("op").unwrap_or("n");
+                                // OPLOG-063: look up post_image from batched result
                                 let post_image = if op == "u" {
-                                    // OPLOG-032: read-back for updates
-                                    Self::read_back_post_image(
-                                        &client, entry, &db_name, &coll_name,
-                                    )
-                                    .await
+                                    entry
+                                        .get_document("o2")
+                                        .ok()
+                                        .and_then(|o2| o2.get("_id"))
+                                        .and_then(|id| post_images.get(&bson_to_key(id)).cloned())
                                 } else {
                                     None
                                 };
@@ -1441,6 +1474,8 @@ impl MongodbOplogSplitReader {
     }
 
     /// Read-back for update operations to get the full post-image (OPLOG-032).
+    /// Kept as fallback; the hot path now uses `batch_read_back_post_images`.
+    #[allow(dead_code)]
     async fn read_back_post_image(
         client: &mongodb::Client,
         entry: &Document,
@@ -1462,6 +1497,80 @@ impl MongodbOplogSplitReader {
             }
         }
     }
+
+    /// Batched read-back for update operations (OPLOG-063).
+    ///
+    /// Issues `find({_id: {$in: [...]}})` queries in sub-batches of
+    /// `batch_max` IDs. Returns a map from `_id` → full document.
+    /// IDs not found (e.g., deleted between update and read-back) are
+    /// logged at warn level and omitted from the result.
+    pub(crate) async fn batch_read_back_post_images(
+        client: &mongodb::Client,
+        db_name: &str,
+        coll_name: &str,
+        ids: &[Bson],
+        batch_max: usize,
+    ) -> HashMap<String, Document> {
+        use futures::TryStreamExt;
+
+        let coll = client
+            .database(db_name)
+            .collection::<Document>(coll_name);
+
+        let mut result = HashMap::with_capacity(ids.len());
+
+        for chunk in ids.chunks(batch_max) {
+            let filter = doc! { "_id": { "$in": chunk.to_vec() } };
+            match coll.find(filter, None).await {
+                Ok(cursor) => {
+                    let docs: Vec<Document> = match cursor.try_collect().await {
+                        Ok(docs) => docs,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                chunk_size = chunk.len(),
+                                "OPLOG-063: Failed to collect batched read-back cursor"
+                            );
+                            continue;
+                        }
+                    };
+                    for doc in docs {
+                        if let Some(id) = doc.get("_id") {
+                            result.insert(bson_to_key(id), doc.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        chunk_size = chunk.len(),
+                        "OPLOG-063: Failed to issue batched read-back query"
+                    );
+                }
+            }
+        }
+
+        // Log any IDs that were not found
+        let missing = ids.len() - result.len();
+        if missing > 0 {
+            tracing::warn!(
+                missing_count = missing,
+                total = ids.len(),
+                "OPLOG-063: Some update _id values not found during batched read-back \
+                 (documents may have been deleted between update and read-back)"
+            );
+        }
+
+        result
+    }
+}
+
+/// Convert a BSON value to a deterministic string key for HashMap lookups.
+///
+/// Uses the canonical extended JSON representation which is unique and
+/// deterministic for any given BSON value.
+pub(crate) fn bson_to_key(bson: &Bson) -> String {
+    bson.to_string()
 }
 
 /// Rough estimate of BSON document size in bytes for buffer management.
@@ -2477,5 +2586,32 @@ mod tests {
         assert_eq!(restored.oplog_ts_secs, 200);
         assert_eq!(restored.oplog_ts_ord, 2);
         assert!(restored.snapshot_chunks.as_ref().unwrap()[1].done);
+    }
+
+    // ── OPLOG-063: bson_to_key determinism ──────────────────────────
+
+    #[test]
+    fn test_bson_to_key_objectid_deterministic() {
+        use mongodb::bson::oid::ObjectId;
+        let oid = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+        let bson = Bson::ObjectId(oid);
+        let k1 = bson_to_key(&bson);
+        let k2 = bson_to_key(&bson);
+        assert_eq!(k1, k2);
+        assert!(!k1.is_empty());
+    }
+
+    #[test]
+    fn test_bson_to_key_different_types_differ() {
+        let int_key = bson_to_key(&Bson::Int32(42));
+        let str_key = bson_to_key(&Bson::String("42".to_owned()));
+        assert_ne!(int_key, str_key, "int32(42) and string(\"42\") must have different keys");
+    }
+
+    #[test]
+    fn test_bson_to_key_same_value_same_key() {
+        let a = bson_to_key(&Bson::Int64(999));
+        let b = bson_to_key(&Bson::Int64(999));
+        assert_eq!(a, b);
     }
 }

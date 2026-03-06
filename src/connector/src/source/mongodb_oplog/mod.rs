@@ -85,6 +85,14 @@ fn default_snapshot_boundary_mode() -> String {
     "min_max".to_owned()
 }
 
+const fn default_readback_batch_max_count() -> u64 {
+    128
+}
+
+const fn default_readback_batch_timeout_ms() -> u64 {
+    50
+}
+
 /// Properties for the `mongo-oplog` source connector.
 ///
 /// Tails `local.oplog.rs` on a MongoDB replica set member using the
@@ -178,6 +186,24 @@ pub struct MongodbOplogProperties {
     )]
     pub snapshot_boundary_mode: String,
 
+    /// Maximum number of `_id` values per batched `$in` read-back query (OPLOG-061).
+    /// Range: 1–4096. Default: 128.
+    #[serde(
+        rename = "mongodb.readback.batch_max_count",
+        default = "default_readback_batch_max_count"
+    )]
+    #[serde_as(as = "DisplayFromStr")]
+    pub readback_batch_max_count: u64,
+
+    /// Expected batching window in ms for read-back flushes (OPLOG-062).
+    /// Range: 1–5000. Default: 50.
+    #[serde(
+        rename = "mongodb.readback.batch_timeout_ms",
+        default = "default_readback_batch_timeout_ms"
+    )]
+    #[serde_as(as = "DisplayFromStr")]
+    pub readback_batch_timeout_ms: u64,
+
     /// Startup mode: snapshot (default), latest, earliest (OPLOG-036)
     #[serde(rename = "scan.startup.mode")]
     pub scan_startup_mode: Option<String>,
@@ -264,6 +290,25 @@ impl MongodbOplogProperties {
         Ok(())
     }
 
+    /// Validate readback batching settings (OPLOG-061/062).
+    pub fn validate_readback_config(&self) -> ConnectorResult<()> {
+        if self.readback_batch_max_count < 1 || self.readback_batch_max_count > 4096 {
+            return Err(anyhow::anyhow!(
+                "mongodb.readback.batch_max_count must be between 1 and 4096, got: {}",
+                self.readback_batch_max_count
+            )
+            .into());
+        }
+        if self.readback_batch_timeout_ms < 1 || self.readback_batch_timeout_ms > 5000 {
+            return Err(anyhow::anyhow!(
+                "mongodb.readback.batch_timeout_ms must be between 1 and 5000, got: {}",
+                self.readback_batch_timeout_ms
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// Build a MongoDB client from the connection URI (OPLOG-037).
     ///
     /// Returns `(Client, replica_set_name)`. The replica set name is extracted
@@ -327,6 +372,8 @@ mod tests {
         assert_eq!(props.shard_discovery_interval_secs, 30);
         assert_eq!(props.snapshot_workers_per_shard, 1);
         assert_eq!(props.snapshot_chunk_target_docs, 10_000);
+        assert_eq!(props.readback_batch_max_count, 128);
+        assert_eq!(props.readback_batch_timeout_ms, 50);
         assert_eq!(props.scan_startup_mode, None);
     }
 
@@ -568,5 +615,77 @@ mod tests {
         let props: MongodbOplogProperties =
             serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
         assert!(props.validate_snapshot_config().is_err());
+    }
+
+    // ── OPLOG-061/062: readback batching config ──────────────────────
+
+    #[test]
+    fn test_readback_batch_defaults() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "mongodb.url".to_owned() => "mongodb://localhost:27017".to_owned(),
+            "mongodb.namespace".to_owned() => "mydb.mycoll".to_owned(),
+        };
+        let props: MongodbOplogProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(props.readback_batch_max_count, 128);
+        assert_eq!(props.readback_batch_timeout_ms, 50);
+        assert!(props.validate_readback_config().is_ok());
+    }
+
+    #[test]
+    fn test_readback_batch_max_count_overrides() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "mongodb.url".to_owned() => "mongodb://localhost:27017".to_owned(),
+            "mongodb.namespace".to_owned() => "mydb.mycoll".to_owned(),
+            "mongodb.readback.batch_max_count".to_owned() => "256".to_owned(),
+            "mongodb.readback.batch_timeout_ms".to_owned() => "100".to_owned(),
+        };
+        let props: MongodbOplogProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(props.readback_batch_max_count, 256);
+        assert_eq!(props.readback_batch_timeout_ms, 100);
+    }
+
+    #[test]
+    fn test_readback_batch_max_count_validation_range() {
+        let make = |val: u64| -> MongodbOplogProperties {
+            let config: BTreeMap<String, String> = btreemap! {
+                "mongodb.url".to_owned() => "mongodb://localhost:27017".to_owned(),
+                "mongodb.namespace".to_owned() => "mydb.mycoll".to_owned(),
+                "mongodb.readback.batch_max_count".to_owned() => val.to_string(),
+            };
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap()
+        };
+
+        // Valid boundaries
+        assert!(make(1).validate_readback_config().is_ok());
+        assert!(make(128).validate_readback_config().is_ok());
+        assert!(make(4096).validate_readback_config().is_ok());
+
+        // Out of range
+        assert!(make(0).validate_readback_config().is_err());
+        assert!(make(4097).validate_readback_config().is_err());
+        assert!(make(10000).validate_readback_config().is_err());
+    }
+
+    #[test]
+    fn test_readback_batch_timeout_ms_validation_range() {
+        let make = |val: u64| -> MongodbOplogProperties {
+            let config: BTreeMap<String, String> = btreemap! {
+                "mongodb.url".to_owned() => "mongodb://localhost:27017".to_owned(),
+                "mongodb.namespace".to_owned() => "mydb.mycoll".to_owned(),
+                "mongodb.readback.batch_timeout_ms".to_owned() => val.to_string(),
+            };
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap()
+        };
+
+        // Valid boundaries
+        assert!(make(1).validate_readback_config().is_ok());
+        assert!(make(50).validate_readback_config().is_ok());
+        assert!(make(5000).validate_readback_config().is_ok());
+
+        // Out of range
+        assert!(make(0).validate_readback_config().is_err());
+        assert!(make(5001).validate_readback_config().is_err());
     }
 }

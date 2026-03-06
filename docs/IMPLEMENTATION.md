@@ -162,17 +162,43 @@ Sources: [Compatibility](https://www.mongodb.com/docs/drivers/rust/current/compa
   - `sample` mode: existing $sample pipeline + dedup (SERVER-20385)
   - Pure functions: `objectid_to_u128`, `u128_to_objectid`, `compute_synthetic_splits`
   - 15 new unit tests, 4 new integration tests
+- [x] Phase 10: Batched read-back for update operations (OPLOG-061–063)
+  - `mongodb.readback.batch_max_count` config (default 128, range 1–4096)
+  - `mongodb.readback.batch_timeout_ms` config (default 50, range 1–5000)
+  - Replaced per-update `findOne` with batched `find({_id: {$in: [...]}})` in CDC release loop
+  - Sub-batch chunking when updates exceed `batch_max_count`
+  - Graceful handling of deleted-between-update-and-readback documents
+  - `bson_to_key` helper for HashMap keying (Bson → deterministic String)
+  - 7 new unit tests, 2 new integration tests
+
+### Configuration Reference
+
+| Property | Default | Range | EARS Tag |
+|:---------|:--------|:------|:---------|
+| `mongodb.url` | — | — | OPLOG-028 |
+| `mongodb.namespace` | — | — | OPLOG-003 |
+| `mongodb.watermark.poll_interval_ms` | 100 | — | OPLOG-004 |
+| `mongodb.buffer.max_bytes` | 104857600 | — | OPLOG-008 |
+| `mongodb.watermark.stall_timeout_secs` | 30 | — | OPLOG-008a |
+| `mongodb.heartbeat.interval_secs` | 60 | — | OPLOG-025 |
+| `mongodb.snapshot.batch_size` | 1024 | — | OPLOG-033 |
+| `mongodb.shard.discovery.interval_secs` | 30 | — | OPLOG-046 |
+| `mongodb.snapshot.workers_per_shard` | 1 | 1–64 | OPLOG-047 |
+| `mongodb.snapshot.chunk_target_docs` | 10000 | ≥100 | OPLOG-048 |
+| `mongodb.snapshot.boundary_mode` | min_max | min_max, sample | OPLOG-054 |
+| `mongodb.readback.batch_max_count` | 128 | 1–4096 | OPLOG-061 |
+| `mongodb.readback.batch_timeout_ms` | 50 | 1–5000 | OPLOG-062 |
+| `scan.startup.mode` | snapshot | snapshot, latest, earliest | OPLOG-036 |
 
 ### Test Count
 
 | Level | Count | Scope |
 |:------|:------|:------|
-| Unit | ~84 | Config, serde, durability, watermark, quantile boundaries, offset rewriting, ObjectId/u128 conversion, synthetic splits, boundary mode config |
-| Integration | ~22 | Snapshot, resume, modes, sharding, boundary discovery, chunked snapshot, min_max mode |
+| Unit | ~91 | Config, serde, durability, watermark, quantile boundaries, offset rewriting, ObjectId/u128 conversion, synthetic splits, boundary mode config, readback batching, bson_to_key |
+| Integration | ~24 | Snapshot, resume, modes, sharding, boundary discovery, chunked snapshot, min_max mode, batched readback |
 | E2E | 1 | Serial pipeline (Phase 7, pending) |
 
 ### Future Improvements
 
-- **Batched read-back**: Collect update `_id` values and issue batched `find({_id: {$in: [...]}})` every 100ms or at max batch size (1024), instead of individual `findOne` per update
 - **MongoDB 3.6 support**: Implemented — using `mongodb` Rust driver v2.8.2 which supports server 3.6+
 - **Change Stream pre/post images**: Use MongoDB 6.0+ `changeStreamPreAndPostImages` to avoid read-back

@@ -1434,3 +1434,122 @@ async fn test_chunked_snapshot_with_min_max_mode() {
 
     assert_eq!(all_ids.len(), 200, "min_max mode should capture all 200 docs");
 }
+
+// ── OPLOG-063: batched read-back integration tests ──────────────────
+
+/// Insert several documents, update them, then verify batched read-back
+/// returns correct post-images for all updated docs.
+#[tokio::test]
+#[ignore]
+async fn test_batched_readback_multiple_updates() {
+    use mongodb::bson::Bson;
+    use super::reader::{MongodbOplogSplitReader, bson_to_key};
+
+    let (_container, uri) = start_mongo_rs().await;
+
+    let client_opts = ClientOptions::parse_async(&uri)
+        .await
+        .expect("failed to parse URI");
+    let client =
+        mongodb::Client::with_options(client_opts).expect("failed to create mongo client");
+
+    let db = client.database("readback_test");
+    let coll = db.collection::<Document>("docs");
+
+    // Insert 10 documents
+    let mut ids = Vec::new();
+    for i in 0..10 {
+        let doc = doc! { "value": i, "label": format!("doc_{}", i) };
+        let result = coll
+            .insert_one(doc, majority_insert_opts())
+            .await
+            .expect("insert failed");
+        ids.push(result.inserted_id.clone());
+    }
+
+    // Update all 10 documents
+    for (i, id) in ids.iter().enumerate() {
+        coll.update_one(
+            doc! { "_id": id },
+            doc! { "$set": { "value": (i as i32) * 10 } },
+            None,
+        )
+        .await
+        .expect("update failed");
+    }
+
+    // Build the Bson ID list for batched read-back
+    let bson_ids: Vec<Bson> = ids.iter().map(|id| id.clone()).collect();
+
+    // Test with batch_max = 3 to verify chunking across multiple sub-batches
+    let post_images = MongodbOplogSplitReader::batch_read_back_post_images(
+        &client,
+        "readback_test",
+        "docs",
+        &bson_ids,
+        3,
+    )
+    .await;
+
+    assert_eq!(post_images.len(), 10, "should have post-images for all 10 docs");
+
+    // Verify each post-image has the updated value
+    for (i, id) in ids.iter().enumerate() {
+        let key = bson_to_key(id);
+        let doc = post_images.get(&key).unwrap_or_else(|| panic!("missing post-image for id {}", key));
+        let val = doc.get_i32("value").expect("missing 'value' field");
+        assert_eq!(val, (i as i32) * 10, "post-image should have updated value");
+    }
+}
+
+/// Update a document then delete it — batched read-back should gracefully
+/// handle the missing post-image.
+#[tokio::test]
+#[ignore]
+async fn test_batched_readback_with_deleted_doc() {
+    use mongodb::bson::Bson;
+    use super::reader::{MongodbOplogSplitReader, bson_to_key};
+
+    let (_container, uri) = start_mongo_rs().await;
+
+    let client_opts = ClientOptions::parse_async(&uri)
+        .await
+        .expect("failed to parse URI");
+    let client =
+        mongodb::Client::with_options(client_opts).expect("failed to create mongo client");
+
+    let db = client.database("readback_del_test");
+    let coll = db.collection::<Document>("docs");
+
+    // Insert 3 docs
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let result = coll
+            .insert_one(doc! { "x": i }, majority_insert_opts())
+            .await
+            .expect("insert failed");
+        ids.push(result.inserted_id.clone());
+    }
+
+    // Delete the middle document (simulates delete-between-update-and-readback)
+    coll.delete_one(doc! { "_id": &ids[1] }, None)
+        .await
+        .expect("delete failed");
+
+    let bson_ids: Vec<Bson> = ids.iter().map(|id| id.clone()).collect();
+
+    let post_images = MongodbOplogSplitReader::batch_read_back_post_images(
+        &client,
+        "readback_del_test",
+        "docs",
+        &bson_ids,
+        128,
+    )
+    .await;
+
+    // Should find 2 of 3 — the deleted doc is gracefully missing
+    assert_eq!(post_images.len(), 2, "deleted doc should be absent from results");
+    assert!(post_images.contains_key(&bson_to_key(&ids[0])));
+    assert!(!post_images.contains_key(&bson_to_key(&ids[1])), "deleted doc should be missing");
+    assert!(post_images.contains_key(&bson_to_key(&ids[2])));
+}
