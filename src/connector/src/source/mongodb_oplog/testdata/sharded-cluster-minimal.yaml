@@ -1,0 +1,27 @@
+# Minimal sharded cluster for integration tests (OPLOG-040 through OPLOG-045)
+# 1 config server, 2 single-node shards, 1 mongos
+
+global:
+  user: mongodb
+  deploy_dir: mongodb
+  data_dir: data
+  log_dir: log
+  config_dir: etc
+
+config_servers:
+  - host: localhost
+    port: 0
+    replica_set: configRS
+
+mongod_servers:
+  - host: localhost
+    port: 0
+    replica_set: shard1
+
+  - host: localhost
+    port: 0
+    replica_set: shard2
+
+mongos_servers:
+  - host: localhost
+    port: 0

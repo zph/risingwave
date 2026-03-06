@@ -1,0 +1,204 @@
+# Implementation Status
+
+## mongo-oplog Connector
+
+**Status**: In Progress
+**Spec**: `docs/specs/mongodb-oplog-tailer-requirements.md`
+
+### Overview
+
+Native RisingWave source connector that tails MongoDB's `local.oplog.rs` capped collection using the High-Watermark Tailer pattern. Replaces the need for Debezium JNI for MongoDB CDC.
+
+- **Minimum MongoDB version**: 3.6 (using `mongodb` Rust driver v2.8.2)
+- **Read preference**: `secondaryPreferred` (default when URI has no `readPreference`), configurable via URI
+- **Message format**: Debezium-compatible JSON (reuses `DebeziumMongoJsonParser`)
+- **Sharded clusters**: Automatic shard discovery via mongos (`listShards`); one split per shard
+
+### Architecture
+
+```
+MongodbOplogSplitReader
+├── Snapshot Phase (on first start)
+│   ├── Serial (workers=1): collection.find({}).sort({_id: 1}) → SourceMessage yield
+│   ├── Chunked (workers>1): boundary discovery → N chunks of ~10K docs
+│   │   ├── Boundary discovery (OPLOG-054):
+│   │   │   ├── min_max (default): 2 index lookups + arithmetic splits (ObjectId/Int32/Int64 only)
+│   │   │   └── sample: $sample 10K docs, sort, dedup, quantile split points
+│   │   ├── Work queue: Arc<Mutex<Vec<usize>>> of pending chunk indices
+│   │   ├── Worker pool: min(workers_per_shard, pending_chunks) tokio tasks
+│   │   ├── Each worker: find({_id: {$gte: min, $lt: max}}).sort({_id: 1})
+│   │   ├── Bounded mpsc channel (4 * num_workers): backpressure
+│   │   ├── Shared state: Arc<Mutex<Vec<SnapshotChunkState>>> for crash recovery
+│   │   └── Offset rewriting: each yielded batch includes full chunk state
+│   └── Oplog window guard (OPLOG-053): per-batch check of oldest oplog entry
+│       ├── Emits oplog_snapshot_window_remaining_pct gauge (0-100%)
+│       ├── Emits oplog_snapshot_docs_total counter
+│       ├── WARN if within 20% of oplog tail
+│       └── ABORT if snapshot_start_ts overwritten by capped collection wrap
+├── WatermarkPollTask (tokio::spawn)
+│   └── replSetGetStatus every 100ms → Arc<AtomicU64>
+└── CDC Phase (oplog tailing)
+    └── tailable cursor on local.oplog.rs → buffer → watermark gate → yield
+```
+
+### SQL DDL
+
+```sql
+CREATE SOURCE mongo_events WITH (
+    connector = 'mongo-oplog',
+    mongodb.url = 'mongodb://user:pass@host1:27017/?replicaSet=rs0&readPreference=secondaryPreferred',
+    mongodb.namespace = 'mydb.mycollection'
+) FORMAT DEBEZIUM_MONGO ENCODE JSON;
+```
+
+### Files
+
+| File | Purpose |
+|:-----|:--------|
+| `src/connector/src/source/mongodb_oplog/mod.rs` | Properties, config, connector registration |
+| `src/connector/src/source/mongodb_oplog/split.rs` | Split metadata + offset persistence |
+| `src/connector/src/source/mongodb_oplog/enumerator.rs` | Split enumeration (single-RS or sharded auto-discovery) |
+| `src/connector/src/source/mongodb_oplog/reader.rs` | Core reader: snapshot + oplog tailing |
+| `src/connector/src/source/mongodb_oplog/message.rs` | Oplog → Debezium JSON serialization |
+| `src/connector/src/source/mongodb_oplog/oplog_types.rs` | Constants, offset types, watermark encoding |
+
+### Modified Files
+
+| File | Change |
+|:-----|:-------|
+| `src/connector/src/macros.rs` | Register `MongodbOplog` in `for_all_classified_sources!` |
+| `src/connector/src/source/mod.rs` | Add `pub mod mongodb_oplog` + re-export |
+| `src/frontend/src/handler/create_source.rs` | Import `MONGO_OPLOG_CONNECTOR` |
+| `src/frontend/src/handler/create_source/validate.rs` | Add format compatibility entry |
+
+### Configuration Parameters
+
+| Parameter | Default | Description |
+|:----------|:--------|:------------|
+| `mongodb.url` | (required) | MongoDB connection URI |
+| `mongodb.namespace` | (required) | `db.collection` to capture |
+| `mongodb.watermark.poll_interval_ms` | `100` | Watermark poll interval |
+| `mongodb.buffer.max_bytes` | `104857600` | Max buffer size (100MB) |
+| `mongodb.watermark.stall_timeout_secs` | `30` | Stall warning timeout |
+| `mongodb.heartbeat.interval_secs` | `60` | Heartbeat interval for idle |
+| `mongodb.snapshot.batch_size` | `1024` | Snapshot batch size |
+| `mongodb.shard.discovery.interval_secs` | `30` | Shard discovery polling interval (mongos only) |
+| `mongodb.snapshot.workers_per_shard` | `1` | Parallel snapshot workers (1=serial, max 64). Controls concurrency. |
+| `mongodb.snapshot.chunk_target_docs` | `10000` | Target docs per chunk for boundary discovery. Min 100. |
+| `mongodb.snapshot.boundary_mode` | `min_max` | Boundary discovery: `min_max` (arithmetic, O(1)), `sample` ($sample pipeline) |
+| `scan.startup.mode` | `snapshot` | `snapshot`, `latest`, or `earliest` |
+
+### Read Preference Configuration
+
+Read preference controls which MongoDB replica set member the connector reads from (OPLOG-037).
+
+**Default:** `secondaryPreferred` — applied programmatically when the URI does not include a `readPreference` option. This offloads read load from the Primary while falling back to it when no Secondary is available.
+
+**Configuration:** Set read preference via standard MongoDB URI options in `mongodb.url`:
+
+```
+mongodb://user:pass@host1:27017/?replicaSet=rs0&readPreference=secondary
+```
+
+**Tag sets** for targeting specific members (e.g., analytics nodes in a specific data center):
+
+```
+mongodb://user:pass@host1:27017/?replicaSet=rs0&readPreference=secondary&readPreferenceTags=dc:us-east,workload:analytics
+```
+
+See [MongoDB Connection String URI — Read Preference Options](https://www.mongodb.com/docs/manual/reference/connection-string/#read-preference-options) for full details.
+
+### EARS Spec Tag Coverage
+
+Spec tags `OPLOG-001` through `OPLOG-060` are defined in the requirements doc.
+Code references the relevant spec tag in comments (e.g., `// OPLOG-006: durability invariant`).
+
+### MongoDB Server Version Compatibility
+
+| Rust Driver Version | Min MongoDB Server | Notes |
+|:----|:----|:----|
+| 1.x (EOL) | 3.6 | End of life |
+| **2.x** | **3.6** | **Current in RisingWave (v2.8.2)** |
+| 3.0 – 3.2 | 4.0 | Newer API, drops 3.6 support |
+| 3.3+ | 4.2 | 4.0 support removed |
+
+Sources: [Compatibility](https://www.mongodb.com/docs/drivers/rust/current/compatibility/), [Releases](https://github.com/mongodb/mongo-rust-driver/releases)
+
+### Implementation Phases
+
+- [x] Phase 0: Update EARS spec for native integration + MongoDB v4.0+ support
+- [x] Phase 1: Skeleton module structure + registration
+- [x] Phase 2: Properties + Split + Enumerator with tests (19 unit tests passing)
+- [x] Phase 3: Message serialization (oplog → Debezium JSON)
+- [x] Phase 4: Core reader (high-watermark tailer + snapshot)
+- [x] Phase 5: Mongos shard auto-discovery (OPLOG-040 through OPLOG-046)
+- [x] Phase 6: Integration tests (48 unit + 11 integration)
+  - Single-RS tests via testcontainers (mongo:3.6)
+  - Sharded cluster tests via mup (OPLOG-040/041/045)
+  - Buffer/watermark invariant unit tests (OPLOG-006/007/008a/008b)
+  - BSON type coverage (OPLOG-027)
+  - Startup modes (OPLOG-036) and snapshot→CDC transition (OPLOG-035)
+
+- [ ] Phase 7: E2E test — mongo-oplog source → S3 Parquet sink via MinIO
+  - Python E2E script (`e2e_test/s3/mongo_oplog_parquet_sink.py`)
+  - Seeds MongoDB via pymongo, creates RW source/MV/sink pipeline
+  - Verifies .parquet files appear in MinIO bucket
+  - Reads parquet back via S3 source table, asserts row count >= 20
+  - Makefile target: `make test-e2e-mongo-parquet`
+- [x] Phase 8: Chunked parallel snapshot (OPLOG-047–052)
+  - `mongodb.snapshot.workers_per_shard` config (default 1, range 1–64)
+  - `$sample`-based boundary discovery: chunks of ~10K docs (constant `SNAPSHOT_CHUNK_TARGET_DOCS`)
+  - Worker pool with bounded mpsc channel (4 * workers capacity)
+  - Per-chunk crash recovery via `SnapshotChunkState` in offset
+  - 3 new metrics: `oplog_snapshot_chunks_total`, `oplog_snapshot_chunks_done`, `oplog_snapshot_docs_per_chunk`
+  - 11 new unit tests, 8 new integration tests
+  - Design: workers pull from a shared work queue (many small chunks, N concurrent workers)
+  - Backward-compatible: `snapshot_chunks` uses `#[serde(default, skip_serializing_if)]`
+- [x] Phase 9: Two boundary discovery modes (OPLOG-054–060)
+  - `mongodb.snapshot.boundary_mode` config: `min_max` (default) or `sample`
+  - `min_max` mode: 2 O(1) index lookups + synthetic arithmetic splits
+    - Supports ObjectId (u128 arithmetic), Int32, Int64
+    - Unsupported types fail loudly at startup with guidance to use `sample`
+  - `sample` mode: existing $sample pipeline + dedup (SERVER-20385)
+  - Pure functions: `objectid_to_u128`, `u128_to_objectid`, `compute_synthetic_splits`
+  - 15 new unit tests, 4 new integration tests
+- [x] Phase 10: Batched read-back for update operations (OPLOG-061–063)
+  - `mongodb.readback.batch_max_count` config (default 128, range 1–4096)
+  - `mongodb.readback.batch_timeout_ms` config (default 50, range 1–5000)
+  - Replaced per-update `findOne` with batched `find({_id: {$in: [...]}})` in CDC release loop
+  - Sub-batch chunking when updates exceed `batch_max_count`
+  - Graceful handling of deleted-between-update-and-readback documents
+  - `bson_to_key` helper for HashMap keying (Bson → deterministic String)
+  - 7 new unit tests, 2 new integration tests
+
+### Configuration Reference
+
+| Property | Default | Range | EARS Tag |
+|:---------|:--------|:------|:---------|
+| `mongodb.url` | — | — | OPLOG-028 |
+| `mongodb.namespace` | — | — | OPLOG-003 |
+| `mongodb.watermark.poll_interval_ms` | 100 | — | OPLOG-004 |
+| `mongodb.buffer.max_bytes` | 104857600 | — | OPLOG-008 |
+| `mongodb.watermark.stall_timeout_secs` | 30 | — | OPLOG-008a |
+| `mongodb.heartbeat.interval_secs` | 60 | — | OPLOG-025 |
+| `mongodb.snapshot.batch_size` | 1024 | — | OPLOG-033 |
+| `mongodb.shard.discovery.interval_secs` | 30 | — | OPLOG-046 |
+| `mongodb.snapshot.workers_per_shard` | 1 | 1–64 | OPLOG-047 |
+| `mongodb.snapshot.chunk_target_docs` | 10000 | ≥100 | OPLOG-048 |
+| `mongodb.snapshot.boundary_mode` | min_max | min_max, sample | OPLOG-054 |
+| `mongodb.readback.batch_max_count` | 128 | 1–4096 | OPLOG-061 |
+| `mongodb.readback.batch_timeout_ms` | 50 | 1–5000 | OPLOG-062 |
+| `scan.startup.mode` | snapshot | snapshot, latest, earliest | OPLOG-036 |
+
+### Test Count
+
+| Level | Count | Scope |
+|:------|:------|:------|
+| Unit | ~91 | Config, serde, durability, watermark, quantile boundaries, offset rewriting, ObjectId/u128 conversion, synthetic splits, boundary mode config, readback batching, bson_to_key |
+| Integration | ~24 | Snapshot, resume, modes, sharding, boundary discovery, chunked snapshot, min_max mode, batched readback |
+| E2E | 1 | Serial pipeline (Phase 7, pending) |
+
+### Future Improvements
+
+- **MongoDB 3.6 support**: Implemented — using `mongodb` Rust driver v2.8.2 which supports server 3.6+
+- **Change Stream pre/post images**: Use MongoDB 6.0+ `changeStreamPreAndPostImages` to avoid read-back
