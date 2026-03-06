@@ -140,6 +140,15 @@ pub struct SourceMetrics {
     pub oplog_lag_seconds: LabelGuardedIntGaugeVec,
     pub oplog_rollbacks_total: LabelGuardedIntCounterVec,
     pub oplog_reconnects_total: LabelGuardedIntCounterVec,
+
+    // mongo-oplog snapshot phase (OPLOG-053)
+    pub oplog_snapshot_window_remaining_pct: LabelGuardedIntGaugeVec,
+    pub oplog_snapshot_docs_total: LabelGuardedIntCounterVec,
+
+    // mongo-oplog chunked snapshot (OPLOG-052)
+    pub oplog_snapshot_chunks_total: LabelGuardedIntGaugeVec,
+    pub oplog_snapshot_chunks_done: LabelGuardedIntGaugeVec,
+    pub oplog_snapshot_docs_per_chunk: LabelGuardedHistogramVec,
 }
 
 pub static GLOBAL_SOURCE_METRICS: LazyLock<SourceMetrics> =
@@ -342,6 +351,50 @@ impl SourceMetrics {
         )
         .unwrap();
 
+        let oplog_snapshot_window_remaining_pct = register_guarded_int_gauge_vec_with_registry!(
+            "oplog_snapshot_window_remaining_pct",
+            "Percentage of oplog window remaining relative to snapshot_start_ts (0-100, 0 = wrapped)",
+            &["source_id", "source_name", "fragment_id", "split_id"],
+            registry
+        )
+        .unwrap();
+
+        let oplog_snapshot_docs_total = register_guarded_int_counter_vec_with_registry!(
+            "oplog_snapshot_docs_total",
+            "Total documents read during snapshot phase",
+            &["source_id", "source_name", "fragment_id", "split_id"],
+            registry
+        )
+        .unwrap();
+
+        let oplog_snapshot_chunks_total = register_guarded_int_gauge_vec_with_registry!(
+            "oplog_snapshot_chunks_total",
+            "Total number of snapshot chunks for parallel backfill (OPLOG-052)",
+            &["source_id", "source_name", "fragment_id", "split_id"],
+            registry
+        )
+        .unwrap();
+
+        let oplog_snapshot_chunks_done = register_guarded_int_gauge_vec_with_registry!(
+            "oplog_snapshot_chunks_done",
+            "Number of completed snapshot chunks (OPLOG-052)",
+            &["source_id", "source_name", "fragment_id", "split_id"],
+            registry
+        )
+        .unwrap();
+
+        let oplog_snapshot_docs_per_chunk_opts = histogram_opts!(
+            "oplog_snapshot_docs_per_chunk",
+            "Documents processed per snapshot chunk (OPLOG-052)",
+            vec![100.0, 500.0, 1_000.0, 5_000.0, 10_000.0, 50_000.0, 100_000.0, 500_000.0, 1_000_000.0],
+        );
+        let oplog_snapshot_docs_per_chunk = register_guarded_histogram_vec_with_registry!(
+            oplog_snapshot_docs_per_chunk_opts,
+            &["source_id", "source_name", "fragment_id", "split_id"],
+            registry
+        )
+        .unwrap();
+
         SourceMetrics {
             partition_input_count,
             partition_input_bytes,
@@ -369,6 +422,11 @@ impl SourceMetrics {
             oplog_lag_seconds,
             oplog_rollbacks_total,
             oplog_reconnects_total,
+            oplog_snapshot_window_remaining_pct,
+            oplog_snapshot_docs_total,
+            oplog_snapshot_chunks_total,
+            oplog_snapshot_chunks_done,
+            oplog_snapshot_docs_per_chunk,
         }
     }
 }

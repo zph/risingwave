@@ -18,6 +18,26 @@ use serde::{Deserialize, Serialize};
 use crate::error::ConnectorResult;
 use crate::source::{SplitId, SplitMetaData};
 
+/// Per-chunk state for parallel snapshot recovery (OPLOG-050).
+///
+/// Each chunk tracks its `_id` range and resume position. The vector of
+/// chunk states is persisted in `MongodbOplogOffset::snapshot_chunks` at
+/// each checkpoint so that crash recovery can skip completed chunks and
+/// resume incomplete ones from their last processed `_id`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SnapshotChunkState {
+    /// Index of this chunk in the boundary list.
+    pub chunk_idx: usize,
+    /// Lower bound `_id` (BSON ExtJSON). `None` = start of collection.
+    pub min_id: Option<String>,
+    /// Upper bound `_id` (BSON ExtJSON). `None` = end of collection.
+    pub max_id: Option<String>,
+    /// Last successfully processed `_id` within this chunk (resume point).
+    pub last_id: Option<String>,
+    /// Whether this chunk has been fully scanned.
+    pub done: bool,
+}
+
 /// Persisted offset state for the mongo-oplog source.
 ///
 /// During the snapshot phase, tracks the last `_id` scanned (OPLOG-034).
@@ -33,6 +53,11 @@ pub struct MongodbOplogOffset {
     pub oplog_ts_secs: u32,
     /// Oplog timestamp ordinal component for CDC resumption (OPLOG-014).
     pub oplog_ts_ord: u32,
+    /// Per-chunk state for parallel snapshot (OPLOG-050).
+    /// Present only during chunked snapshot; cleared on phase transition to CDC.
+    /// Backward-compatible: old offsets without this field deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_chunks: Option<Vec<SnapshotChunkState>>,
 }
 
 impl MongodbOplogOffset {
@@ -43,6 +68,7 @@ impl MongodbOplogOffset {
             snapshot_last_id: None,
             oplog_ts_secs: 0,
             oplog_ts_ord: 0,
+            snapshot_chunks: None,
         }
     }
 
@@ -120,6 +146,7 @@ mod tests {
             snapshot_last_id: Some("{\"$oid\": \"65bc9fb6c485f419a7a877fe\"}".to_owned()),
             oplog_ts_secs: 0,
             oplog_ts_ord: 0,
+            snapshot_chunks: None,
         };
 
         let json = offset.to_json_string();
@@ -134,6 +161,7 @@ mod tests {
             snapshot_last_id: None,
             oplog_ts_secs: 1706968217,
             oplog_ts_ord: 1,
+            snapshot_chunks: None,
         };
 
         let json = offset.to_json_string();
@@ -154,6 +182,7 @@ mod tests {
                     snapshot_last_id: None,
                     oplog_ts_secs: 100,
                     oplog_ts_ord: 2,
+                    snapshot_chunks: None,
                 }
                 .to_json_string(),
             ),
@@ -172,6 +201,78 @@ mod tests {
         assert!(split.offset().unwrap().is_none());
     }
 
+    // ── OPLOG-050: SnapshotChunkState serde ─────────────────────────
+
+    #[test]
+    fn test_snapshot_chunk_state_serde_roundtrip() {
+        let chunk = SnapshotChunkState {
+            chunk_idx: 2,
+            min_id: Some("{\"$oid\": \"aaa\"}".to_owned()),
+            max_id: Some("{\"$oid\": \"bbb\"}".to_owned()),
+            last_id: Some("{\"$oid\": \"abc\"}".to_owned()),
+            done: false,
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        let restored: SnapshotChunkState = serde_json::from_str(&json).unwrap();
+        assert_eq!(chunk, restored);
+    }
+
+    #[test]
+    fn test_offset_with_chunks_serde_roundtrip() {
+        let offset = MongodbOplogOffset {
+            snapshot_done: false,
+            snapshot_last_id: None,
+            oplog_ts_secs: 1000,
+            oplog_ts_ord: 1,
+            snapshot_chunks: Some(vec![
+                SnapshotChunkState {
+                    chunk_idx: 0,
+                    min_id: None,
+                    max_id: Some("{\"$oid\": \"mid\"}".to_owned()),
+                    last_id: Some("{\"$oid\": \"cur\"}".to_owned()),
+                    done: false,
+                },
+                SnapshotChunkState {
+                    chunk_idx: 1,
+                    min_id: Some("{\"$oid\": \"mid\"}".to_owned()),
+                    max_id: None,
+                    last_id: None,
+                    done: true,
+                },
+            ]),
+        };
+        let json = offset.to_json_string();
+        let restored = MongodbOplogOffset::from_json_str(&json).unwrap();
+        assert_eq!(offset, restored);
+    }
+
+    #[test]
+    fn test_offset_backward_compat_no_chunks_field() {
+        // Old JSON without snapshot_chunks field should deserialize as None
+        let json = r#"{"snapshot_done":false,"snapshot_last_id":null,"oplog_ts_secs":100,"oplog_ts_ord":1}"#;
+        let offset = MongodbOplogOffset::from_json_str(json).unwrap();
+        assert!(offset.snapshot_chunks.is_none());
+        assert_eq!(offset.oplog_ts_secs, 100);
+    }
+
+    #[test]
+    fn test_offset_chunks_skipped_when_none() {
+        // When snapshot_chunks is None, it should not appear in JSON
+        let offset = MongodbOplogOffset {
+            snapshot_done: true,
+            snapshot_last_id: None,
+            oplog_ts_secs: 500,
+            oplog_ts_ord: 2,
+            snapshot_chunks: None,
+        };
+        let json = offset.to_json_string();
+        assert!(
+            !json.contains("snapshot_chunks"),
+            "None snapshot_chunks should be skipped in JSON: {}",
+            json
+        );
+    }
+
     #[test]
     fn test_split_update_offset() {
         let mut split = MongodbOplogSplit::new();
@@ -180,6 +281,7 @@ mod tests {
             snapshot_last_id: None,
             oplog_ts_secs: 500,
             oplog_ts_ord: 3,
+            snapshot_chunks: None,
         };
         split.update_offset(offset.to_json_string()).unwrap();
 
