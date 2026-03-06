@@ -19,7 +19,22 @@ Native RisingWave source connector that tails MongoDB's `local.oplog.rs` capped 
 ```
 MongodbOplogSplitReader
 ├── Snapshot Phase (on first start)
-│   └── collection.find({}).sort({_id: 1}) → SourceMessage yield
+│   ├── Serial (workers=1): collection.find({}).sort({_id: 1}) → SourceMessage yield
+│   ├── Chunked (workers>1): boundary discovery → N chunks of ~10K docs
+│   │   ├── Boundary discovery (OPLOG-054):
+│   │   │   ├── min_max (default): 2 index lookups + arithmetic splits (ObjectId/Int32/Int64 only)
+│   │   │   └── sample: $sample 10K docs, sort, dedup, quantile split points
+│   │   ├── Work queue: Arc<Mutex<Vec<usize>>> of pending chunk indices
+│   │   ├── Worker pool: min(workers_per_shard, pending_chunks) tokio tasks
+│   │   ├── Each worker: find({_id: {$gte: min, $lt: max}}).sort({_id: 1})
+│   │   ├── Bounded mpsc channel (4 * num_workers): backpressure
+│   │   ├── Shared state: Arc<Mutex<Vec<SnapshotChunkState>>> for crash recovery
+│   │   └── Offset rewriting: each yielded batch includes full chunk state
+│   └── Oplog window guard (OPLOG-053): per-batch check of oldest oplog entry
+│       ├── Emits oplog_snapshot_window_remaining_pct gauge (0-100%)
+│       ├── Emits oplog_snapshot_docs_total counter
+│       ├── WARN if within 20% of oplog tail
+│       └── ABORT if snapshot_start_ts overwritten by capped collection wrap
 ├── WatermarkPollTask (tokio::spawn)
 │   └── replSetGetStatus every 100ms → Arc<AtomicU64>
 └── CDC Phase (oplog tailing)
@@ -68,6 +83,9 @@ CREATE SOURCE mongo_events WITH (
 | `mongodb.heartbeat.interval_secs` | `60` | Heartbeat interval for idle |
 | `mongodb.snapshot.batch_size` | `1024` | Snapshot batch size |
 | `mongodb.shard.discovery.interval_secs` | `30` | Shard discovery polling interval (mongos only) |
+| `mongodb.snapshot.workers_per_shard` | `1` | Parallel snapshot workers (1=serial, max 64). Controls concurrency. |
+| `mongodb.snapshot.chunk_target_docs` | `10000` | Target docs per chunk for boundary discovery. Min 100. |
+| `mongodb.snapshot.boundary_mode` | `min_max` | Boundary discovery: `min_max` (arithmetic, O(1)), `sample` ($sample pipeline) |
 | `scan.startup.mode` | `snapshot` | `snapshot`, `latest`, or `earliest` |
 
 ### Read Preference Configuration
@@ -92,7 +110,7 @@ See [MongoDB Connection String URI — Read Preference Options](https://www.mong
 
 ### EARS Spec Tag Coverage
 
-Spec tags `OPLOG-001` through `OPLOG-046` are defined in the requirements doc.
+Spec tags `OPLOG-001` through `OPLOG-060` are defined in the requirements doc.
 Code references the relevant spec tag in comments (e.g., `// OPLOG-006: durability invariant`).
 
 ### MongoDB Server Version Compatibility
@@ -127,6 +145,31 @@ Sources: [Compatibility](https://www.mongodb.com/docs/drivers/rust/current/compa
   - Verifies .parquet files appear in MinIO bucket
   - Reads parquet back via S3 source table, asserts row count >= 20
   - Makefile target: `make test-e2e-mongo-parquet`
+- [x] Phase 8: Chunked parallel snapshot (OPLOG-047–052)
+  - `mongodb.snapshot.workers_per_shard` config (default 1, range 1–64)
+  - `$sample`-based boundary discovery: chunks of ~10K docs (constant `SNAPSHOT_CHUNK_TARGET_DOCS`)
+  - Worker pool with bounded mpsc channel (4 * workers capacity)
+  - Per-chunk crash recovery via `SnapshotChunkState` in offset
+  - 3 new metrics: `oplog_snapshot_chunks_total`, `oplog_snapshot_chunks_done`, `oplog_snapshot_docs_per_chunk`
+  - 11 new unit tests, 8 new integration tests
+  - Design: workers pull from a shared work queue (many small chunks, N concurrent workers)
+  - Backward-compatible: `snapshot_chunks` uses `#[serde(default, skip_serializing_if)]`
+- [x] Phase 9: Two boundary discovery modes (OPLOG-054–060)
+  - `mongodb.snapshot.boundary_mode` config: `min_max` (default) or `sample`
+  - `min_max` mode: 2 O(1) index lookups + synthetic arithmetic splits
+    - Supports ObjectId (u128 arithmetic), Int32, Int64
+    - Unsupported types fail loudly at startup with guidance to use `sample`
+  - `sample` mode: existing $sample pipeline + dedup (SERVER-20385)
+  - Pure functions: `objectid_to_u128`, `u128_to_objectid`, `compute_synthetic_splits`
+  - 15 new unit tests, 4 new integration tests
+
+### Test Count
+
+| Level | Count | Scope |
+|:------|:------|:------|
+| Unit | ~84 | Config, serde, durability, watermark, quantile boundaries, offset rewriting, ObjectId/u128 conversion, synthetic splits, boundary mode config |
+| Integration | ~22 | Snapshot, resume, modes, sharding, boundary discovery, chunked snapshot, min_max mode |
+| E2E | 1 | Serial pipeline (Phase 7, pending) |
 
 ### Future Improvements
 

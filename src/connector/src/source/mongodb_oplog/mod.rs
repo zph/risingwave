@@ -39,6 +39,16 @@ use crate::source::mongodb_oplog::split::MongodbOplogSplit;
 // OPLOG-001: connector name constant
 pub const MONGO_OPLOG_CONNECTOR: &str = "mongo-oplog";
 
+/// Boundary discovery mode for chunked parallel snapshot (OPLOG-054).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryMode {
+    /// Use min/max index lookups + arithmetic splits (OPLOG-055/056/057).
+    /// Only supports ObjectId, Int32, Int64 `_id` types. Fails loudly otherwise.
+    MinMax,
+    /// Use `$sample` aggregation pipeline (OPLOG-060).
+    Sample,
+}
+
 const fn default_watermark_poll_interval_ms() -> u64 {
     100
 }
@@ -61,6 +71,18 @@ const fn default_snapshot_batch_size() -> u64 {
 
 const fn default_shard_discovery_interval_secs() -> u64 {
     30
+}
+
+const fn default_snapshot_workers_per_shard() -> u64 {
+    1
+}
+
+const fn default_snapshot_chunk_target_docs() -> u64 {
+    10_000
+}
+
+fn default_snapshot_boundary_mode() -> String {
+    "min_max".to_owned()
 }
 
 /// Properties for the `mongo-oplog` source connector.
@@ -127,6 +149,35 @@ pub struct MongodbOplogProperties {
     #[serde_as(as = "DisplayFromStr")]
     pub shard_discovery_interval_secs: u64,
 
+    /// Number of parallel snapshot workers per shard (OPLOG-047).
+    /// Default 1 (serial). Range: 1–64. Controls concurrency, not chunk count.
+    #[serde(
+        rename = "mongodb.snapshot.workers_per_shard",
+        default = "default_snapshot_workers_per_shard"
+    )]
+    #[serde_as(as = "DisplayFromStr")]
+    pub snapshot_workers_per_shard: u64,
+
+    /// Target number of documents per snapshot chunk (OPLOG-048).
+    /// Boundary discovery divides the collection into chunks of approximately
+    /// this many documents. Chunk count = max(1, estimated_count / target).
+    /// Workers pull from a shared pool; `workers_per_shard` controls concurrency.
+    /// Minimum: 100. Default: 10,000.
+    #[serde(
+        rename = "mongodb.snapshot.chunk_target_docs",
+        default = "default_snapshot_chunk_target_docs"
+    )]
+    #[serde_as(as = "DisplayFromStr")]
+    pub snapshot_chunk_target_docs: u64,
+
+    /// Boundary discovery mode for chunked snapshot (OPLOG-054).
+    /// Values: `min_max` (default), `sample`.
+    #[serde(
+        rename = "mongodb.snapshot.boundary_mode",
+        default = "default_snapshot_boundary_mode"
+    )]
+    pub snapshot_boundary_mode: String,
+
     /// Startup mode: snapshot (default), latest, earliest (OPLOG-036)
     #[serde(rename = "scan.startup.mode")]
     pub scan_startup_mode: Option<String>,
@@ -177,6 +228,40 @@ impl MongodbOplogProperties {
         self.scan_startup_mode
             .as_deref()
             .unwrap_or("snapshot")
+    }
+
+    /// Parse the boundary mode string into the enum (OPLOG-054).
+    pub fn boundary_mode(&self) -> ConnectorResult<BoundaryMode> {
+        match self.snapshot_boundary_mode.as_str() {
+            "min_max" => Ok(BoundaryMode::MinMax),
+            "sample" => Ok(BoundaryMode::Sample),
+            other => Err(anyhow::anyhow!(
+                "mongodb.snapshot.boundary_mode must be 'min_max' or 'sample', got: '{}'",
+                other
+            )
+            .into()),
+        }
+    }
+
+    /// Validate snapshot parallelism settings (OPLOG-047/048/054).
+    pub fn validate_snapshot_config(&self) -> ConnectorResult<()> {
+        if self.snapshot_workers_per_shard < 1 || self.snapshot_workers_per_shard > 64 {
+            return Err(anyhow::anyhow!(
+                "mongodb.snapshot.workers_per_shard must be between 1 and 64, got: {}",
+                self.snapshot_workers_per_shard
+            )
+            .into());
+        }
+        if self.snapshot_chunk_target_docs < 100 {
+            return Err(anyhow::anyhow!(
+                "mongodb.snapshot.chunk_target_docs must be >= 100, got: {}",
+                self.snapshot_chunk_target_docs
+            )
+            .into());
+        }
+        // Validate boundary mode is parseable
+        self.boundary_mode()?;
+        Ok(())
     }
 
     /// Build a MongoDB client from the connection URI (OPLOG-037).
@@ -240,6 +325,8 @@ mod tests {
         assert_eq!(props.heartbeat_interval_secs, 60);
         assert_eq!(props.snapshot_batch_size, 1024);
         assert_eq!(props.shard_discovery_interval_secs, 30);
+        assert_eq!(props.snapshot_workers_per_shard, 1);
+        assert_eq!(props.snapshot_chunk_target_docs, 10_000);
         assert_eq!(props.scan_startup_mode, None);
     }
 
@@ -348,6 +435,63 @@ mod tests {
         );
     }
 
+    // ── OPLOG-047/048: snapshot parallelism config ─────────────────
+
+    #[test]
+    fn test_workers_per_shard_default_is_1() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "mongodb.url".to_owned() => "mongodb://localhost:27017".to_owned(),
+            "mongodb.namespace".to_owned() => "mydb.mycoll".to_owned(),
+        };
+        let props: MongodbOplogProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(props.snapshot_workers_per_shard, 1);
+        assert_eq!(props.snapshot_chunk_target_docs, 10_000);
+        assert!(props.validate_snapshot_config().is_ok());
+    }
+
+    #[test]
+    fn test_workers_per_shard_validation_range() {
+        let make = |val: u64| -> MongodbOplogProperties {
+            let config: BTreeMap<String, String> = btreemap! {
+                "mongodb.url".to_owned() => "mongodb://localhost:27017".to_owned(),
+                "mongodb.namespace".to_owned() => "mydb.mycoll".to_owned(),
+                "mongodb.snapshot.workers_per_shard".to_owned() => val.to_string(),
+            };
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap()
+        };
+
+        // Valid range boundaries
+        assert!(make(1).validate_snapshot_config().is_ok());
+        assert!(make(4).validate_snapshot_config().is_ok());
+        assert!(make(64).validate_snapshot_config().is_ok());
+
+        // Out of range
+        assert!(make(0).validate_snapshot_config().is_err());
+        assert!(make(65).validate_snapshot_config().is_err());
+        assert!(make(128).validate_snapshot_config().is_err());
+    }
+
+    #[test]
+    fn test_chunk_target_docs_validation() {
+        let make = |val: u64| -> MongodbOplogProperties {
+            let config: BTreeMap<String, String> = btreemap! {
+                "mongodb.url".to_owned() => "mongodb://localhost:27017".to_owned(),
+                "mongodb.namespace".to_owned() => "mydb.mycoll".to_owned(),
+                "mongodb.snapshot.chunk_target_docs".to_owned() => val.to_string(),
+            };
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap()
+        };
+
+        assert!(make(100).validate_snapshot_config().is_ok());
+        assert!(make(10_000).validate_snapshot_config().is_ok());
+        assert!(make(1_000_000).validate_snapshot_config().is_ok());
+
+        // Below minimum
+        assert!(make(99).validate_snapshot_config().is_err());
+        assert!(make(0).validate_snapshot_config().is_err());
+    }
+
     #[test]
     fn test_parse_shard_host_to_uri() {
         let uri = parse_shard_host_to_uri("rs1/host1:27017,host2:27017,host3:27017").unwrap();
@@ -363,5 +507,66 @@ mod tests {
     #[test]
     fn test_parse_shard_host_to_uri_invalid() {
         assert!(parse_shard_host_to_uri("no_slash_here").is_err());
+    }
+
+    // ── OPLOG-054: BoundaryMode config ────────────────────────────────
+
+    #[test]
+    fn test_boundary_mode_default_is_min_max() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "mongodb.url".to_owned() => "mongodb://localhost:27017".to_owned(),
+            "mongodb.namespace".to_owned() => "mydb.mycoll".to_owned(),
+        };
+        let props: MongodbOplogProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert!(matches!(props.boundary_mode().unwrap(), BoundaryMode::MinMax));
+    }
+
+    #[test]
+    fn test_boundary_mode_parse_min_max() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "mongodb.url".to_owned() => "mongodb://localhost:27017".to_owned(),
+            "mongodb.namespace".to_owned() => "mydb.mycoll".to_owned(),
+            "mongodb.snapshot.boundary_mode".to_owned() => "min_max".to_owned(),
+        };
+        let props: MongodbOplogProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert!(matches!(props.boundary_mode().unwrap(), BoundaryMode::MinMax));
+    }
+
+    #[test]
+    fn test_boundary_mode_parse_sample() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "mongodb.url".to_owned() => "mongodb://localhost:27017".to_owned(),
+            "mongodb.namespace".to_owned() => "mydb.mycoll".to_owned(),
+            "mongodb.snapshot.boundary_mode".to_owned() => "sample".to_owned(),
+        };
+        let props: MongodbOplogProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert!(matches!(props.boundary_mode().unwrap(), BoundaryMode::Sample));
+    }
+
+    #[test]
+    fn test_boundary_mode_invalid_rejected() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "mongodb.url".to_owned() => "mongodb://localhost:27017".to_owned(),
+            "mongodb.namespace".to_owned() => "mydb.mycoll".to_owned(),
+            "mongodb.snapshot.boundary_mode".to_owned() => "invalid".to_owned(),
+        };
+        let props: MongodbOplogProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert!(props.boundary_mode().is_err());
+    }
+
+    #[test]
+    fn test_validate_snapshot_config_validates_boundary_mode() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "mongodb.url".to_owned() => "mongodb://localhost:27017".to_owned(),
+            "mongodb.namespace".to_owned() => "mydb.mycoll".to_owned(),
+            "mongodb.snapshot.boundary_mode".to_owned() => "invalid".to_owned(),
+        };
+        let props: MongodbOplogProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert!(props.validate_snapshot_config().is_err());
     }
 }

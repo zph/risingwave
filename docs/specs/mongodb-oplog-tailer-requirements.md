@@ -395,6 +395,8 @@ The Oplog Tailer SHALL report metrics via the RisingWave `SourceMetrics` infrast
 | `oplog_lag_seconds` | Gauge | `tail_ts - high_watermark_ts` in seconds |
 | `oplog_rollbacks_total` | Counter | Rollback events detected |
 | `oplog_reconnects_total` | Counter | MongoDB reconnection events |
+| `oplog_snapshot_window_remaining_pct` | Gauge | Oplog window remaining (0–100%) relative to `snapshot_start_ts` (OPLOG-053) |
+| `oplog_snapshot_docs_total` | Counter | Total documents read during snapshot phase (OPLOG-053) |
 
 **Rationale:**
 Comprehensive metrics are essential for production operation, alerting, and debugging.
@@ -727,6 +729,236 @@ Unit test: verify default value is 30. Verify override takes effect.
 
 ---
 
+### 20. Parallel Snapshot Backfill (Future)
+
+**OPLOG-047:** Ubiquitous
+
+**Requirement:**
+The connector SHALL support a `mongodb.snapshot.workers_per_shard` configuration parameter (default: 1, valid range: 1–64) that controls the number of parallel snapshot workers per shard. WHEN set to 1, snapshot behavior SHALL be identical to the current serial model.
+
+**Rationale:**
+For large collections on a single replica set, a sequential `find({}).sort({_id: 1})` cursor is a throughput bottleneck. Parallel workers scanning disjoint `_id` ranges can saturate network and disk I/O more effectively. The default of 1 preserves backward compatibility.
+
+**Verification:**
+Unit test: verify default value is 1, values outside 1–64 are rejected. Integration test: verify workers=1 produces identical output to current serial snapshot.
+
+---
+
+**OPLOG-048:** Event Driven
+
+**Requirement:**
+WHEN `workers_per_shard` > 1 AND no persisted chunk boundaries exist AND `mongodb.snapshot.boundary_mode` = `sample`, the snapshot phase SHALL discover `_id` range boundaries using a `$sample`-based approach: sample 10,000 documents, sort sampled `_id` values, deduplicate them (SERVER-20385), and select quantile split points to divide the collection into N equal-sized chunks (where N = `workers_per_shard`). The discovered boundaries SHALL be persisted in the offset on first checkpoint and reused on crash recovery (boundaries are NOT re-discovered on restart). This is the `sample` boundary mode; see OPLOG-054 for the `min_max` alternative.
+
+**Rationale:**
+`$sample` requires no admin privileges, works on MongoDB 3.6+, and has O(sample_size) cost regardless of collection size. Non-deterministic boundaries are acceptable because they are persisted on first run and reused for crash recovery. Re-running `$sample` after a crash would produce different boundaries, invalidating per-chunk progress tracking. The `$sample` mode has known issues on MongoDB 3.6: slow COLLSCAN path when sample size >= 5% of collection, duplicate samples (SERVER-20385), and 100MB sort limit without `allowDiskUse`. The `min_max` mode (OPLOG-054) avoids these issues for supported `_id` types.
+
+**Verification:**
+Unit test: verify quantile boundary calculation from sorted sample. Integration test: verify boundaries are persisted in offset and reused after simulated restart.
+
+---
+
+**OPLOG-049:** State Driven
+
+**Requirement:**
+WHILE `workers_per_shard` > 1 AND the snapshot phase is active, each chunk SHALL be scanned by an independent tokio task. All chunk tasks SHALL send document batches through a bounded mpsc channel (capacity: 4 batches per worker) to the main reader task, which yields them as `SourceMessage` values. The main reader SHALL apply backpressure via channel capacity — WHEN the channel is full, chunk workers block until the main reader consumes a batch.
+
+**Rationale:**
+Reader-internal parallelism (NOT split-based) keeps 1 split per shard, avoiding changes to the enumerator/split model and complex cross-split phase transitions. Bounded channel capacity of 4 batches per worker prevents memory exhaustion while allowing enough buffering to keep workers busy during yield pauses.
+
+**Verification:**
+Unit test: verify channel backpressure blocks producers when capacity is reached. Integration test: verify N workers produce correct, complete snapshot with no duplicates or gaps.
+
+---
+
+**OPLOG-050:** Event Driven
+
+**Requirement:**
+WHEN a chunk worker completes a batch, it SHALL update its entry in a shared `Arc<Mutex<Vec<SnapshotChunkState>>>`. The main reader SHALL snapshot all chunk states into the offset at each yield point (before yielding a `SourceMessage` batch). On crash recovery, the reader SHALL:
+
+1. Read persisted `snapshot_chunks` from the offset
+2. Skip chunks where `done = true`
+3. For incomplete chunks: resume with `find({_id: {$gt: last_id, $lt: max_id}}).sort({_id: 1})`
+4. Reuse persisted boundaries (do NOT re-run `$sample`)
+
+**Replay window**: Bounded by the RisingWave barrier interval, not by worker count. Each chunk independently resumes from its checkpointed `last_id`.
+
+**Worst-case replay**: If a worker sends a batch but crashes before updating the shared state, that chunk replays one extra batch on recovery. Maximum replay = N × batch_size documents (e.g., 4 workers × 1024 = 4096 docs). All replayed documents are idempotent via `_id`-based upsert semantics downstream.
+
+**Comparison with serial model:**
+
+| Aspect | Serial (workers=1) | Parallel (workers=N) |
+|:-------|:--------------------|:----------------------|
+| Replay bound | 1 barrier interval | 1 barrier interval |
+| Worst-case extra docs | ~1 batch (1024) | ~N batches (N × 1024) |
+| Duplicate safety | `_id` upsert (idempotent) | `_id` upsert (idempotent) |
+| Cross-chunk ordering | N/A | Not guaranteed (OK — snapshot docs have no ordering contract) |
+
+**Rationale:**
+Per-chunk crash recovery via `SnapshotChunkState` ensures that a crash during parallel snapshot does not require restarting the entire snapshot from the beginning. The shared mutex approach is simple and correct because checkpoint writes happen only from the main reader task (single writer), while chunk workers only update their own entry (no cross-chunk contention). Replay is bounded and idempotent.
+
+**Verification:**
+Unit test: verify chunk state serialization/deserialization in offset. Integration test: simulate crash mid-snapshot, verify recovery resumes only incomplete chunks and final data matches serial snapshot output.
+
+---
+
+**OPLOG-051:** Event Driven
+
+**Requirement:**
+WHEN all chunk workers report `done = true`, the main reader SHALL clear the `snapshot_chunks` state from the offset and transition to oplog tailing phase. The phase transition SHALL follow the same semantics as the serial snapshot→oplog transition (OPLOG-035): the oplog resume timestamp is the snapshot start timestamp captured before any chunk workers began.
+
+**Rationale:**
+Clearing chunk state after completion keeps the offset clean for the oplog tailing phase. Using the pre-snapshot timestamp as the oplog resume point ensures no operations are missed between snapshot start and completion, regardless of how long the parallel snapshot takes.
+
+**Verification:**
+Integration test: verify offset contains no `snapshot_chunks` after parallel snapshot completes. Verify oplog tailing resumes from the correct timestamp and no operations are lost.
+
+---
+
+**OPLOG-052:** Ubiquitous
+
+**Requirement:**
+WHEN `workers_per_shard` > 1, the connector SHALL emit the following metrics: `snapshot_chunks_total` (total chunks), `snapshot_chunks_done` (completed chunks), and `snapshot_docs_per_chunk` (histogram of documents processed per chunk). These metrics SHALL be labeled with the shard identifier.
+
+**Rationale:**
+Operators need visibility into parallel snapshot progress to diagnose slow chunks (caused by skewed `_id` distribution) and to estimate remaining snapshot time.
+
+**Verification:**
+Unit test: verify metrics are registered and updated correctly. Integration test: verify metric values match actual chunk progress during a parallel snapshot.
+
+---
+
+### 21. Oplog Window Guard During Snapshot
+
+**OPLOG-053:** Unwanted Behaviour
+
+**Requirement:**
+WHILE the snapshot phase is active, the reader SHALL periodically check whether `snapshot_start_ts` is still within the oplog window. The check SHALL run every `batch_size` documents (i.e., once per batch) by querying the oldest oplog entry via `find({}).sort({$natural: 1}).limit(1)`. IF the oldest oplog entry's `ts` is greater than `snapshot_start_ts`, the snapshot SHALL abort with an unrecoverable error:
+
+```
+Oplog window exhausted during snapshot: snapshot_start_ts={} is older than
+oldest oplog entry={}. The oplog has wrapped and CDC continuity cannot be
+guaranteed. Increase the MongoDB oplog size or reduce collection size before
+retrying with scan.startup.mode='snapshot'.
+```
+
+IF `snapshot_start_ts` is still present but within the 80% danger zone (reusing `is_near_oplog_wrap` logic from OPLOG-008b), the reader SHALL log a structured WARNING every check interval:
+
+```
+Oplog window running low during snapshot: snapshot_start_ts is within 20%
+of oplog tail. Snapshot must complete soon or oplog will wrap, causing
+data loss. Consider increasing oplog size.
+```
+
+The reader SHALL emit the following Prometheus metrics during the snapshot phase (labeled with `source_id`, `source_name`, `fragment_id`, `split_id`):
+
+| Metric | Type | Description |
+|:-------|:-----|:------------|
+| `oplog_snapshot_window_remaining_pct` | Gauge | Percentage (0–100) of the oplog window remaining relative to `snapshot_start_ts`. Drops to 0 on wrap detection. |
+| `oplog_snapshot_docs_total` | Counter | Total documents read during snapshot phase. Incremented per batch. |
+
+These metrics are registered in the global `SourceMetrics` registry and are exported via the standard RisingWave Prometheus endpoint, making them available for Grafana dashboards and PagerDuty/OpsGenie alert rules (e.g., `oplog_snapshot_window_remaining_pct < 30`).
+
+**Rationale:**
+The snapshot phase does not tail the oplog — it runs `find({}).sort({_id: 1})` on the collection. During this time, the oplog continues accumulating writes. If the snapshot takes longer than the oplog retention window (typically hours on busy systems), `snapshot_start_ts` will be overwritten by the capped collection. When the reader transitions to CDC tailing, it cannot resume from a timestamp that no longer exists, resulting in silent data loss for all operations between `snapshot_start_ts` and the oldest surviving oplog entry. Failing fast with a clear error is preferable to silently producing an inconsistent materialized view. The per-batch check frequency bounds the detection latency to one batch worth of documents (~1024) while adding negligible overhead (one `find` with `$natural` sort on the capped collection is O(1)). The Prometheus metrics provide observability for operators to set up proactive alerts before the oplog window is exhausted, rather than relying solely on log scraping.
+
+**Verification:**
+Unit test: verify `is_near_oplog_wrap` correctly identifies danger zone for snapshot timestamps. Integration test: configure a small oplog (e.g., 1MB via `--oplogSize 1`), insert enough data during snapshot to force wrap, verify snapshot aborts with the expected error message rather than silently continuing.
+
+---
+
+### 22. Two Boundary Discovery Modes for Chunked Parallel Snapshot
+
+**OPLOG-054:** Ubiquitous
+
+**Requirement:**
+The connector SHALL support a `mongodb.snapshot.boundary_mode` configuration parameter with values `min_max` (default) and `sample`. This parameter controls how `_id` range boundaries are discovered for chunked parallel snapshots. WHEN `workers_per_shard` > 1 AND no persisted chunk boundaries exist, the boundary mode determines the discovery algorithm.
+
+**Rationale:**
+The `$sample`-based approach (OPLOG-048) has concrete issues on MongoDB 3.6: slow COLLSCAN when sample size >= 5% of collection, duplicate samples (SERVER-20385) producing empty chunks, and 100MB sort limit without `allowDiskUse`. The `min_max` mode uses two O(1) index lookups and arithmetic splits, avoiding all three issues for supported `_id` types.
+
+**Verification:**
+Unit test: verify default value, parsing of both values, rejection of invalid values. Integration test: verify both modes produce correct chunked snapshots.
+
+---
+
+**OPLOG-055:** Event Driven
+
+**Requirement:**
+WHEN `mongodb.snapshot.boundary_mode` = `min_max`, the snapshot phase SHALL discover boundaries by querying the min and max `_id` values (two index-scan queries: `find({}).sort({_id: 1}).limit(1)` and `find({}).sort({_id: -1}).limit(1)`), then generating N-1 synthetic arithmetic split points. The number of chunks N SHALL be `max(1, estimated_document_count / chunk_target_docs)`.
+
+**Rationale:**
+Two index-scan lookups are O(1) and deterministic, unlike `$sample` which is non-deterministic and has O(sample_size) cost. Arithmetic midpoints distribute boundaries evenly across the `_id` range.
+
+**Verification:**
+Integration test: verify min_max discovery on a 200-doc collection produces >= 2 non-overlapping contiguous chunks.
+
+---
+
+**OPLOG-056:** Event Driven
+
+**Requirement:**
+WHEN `mongodb.snapshot.boundary_mode` = `min_max` AND the `_id` field type is `ObjectId`, the connector SHALL convert the 12-byte ObjectId to a zero-padded big-endian u128, compute arithmetic midpoints, and convert back to ObjectId for the split boundaries.
+
+**Rationale:**
+ObjectId is the most common `_id` type in MongoDB. The 12-byte big-endian representation preserves sort order when mapped to u128, enabling straightforward arithmetic splitting.
+
+**Verification:**
+Unit test: verify `objectid_to_u128`/`u128_to_objectid` roundtrip, ordering preservation, and midpoint correctness.
+
+---
+
+**OPLOG-057:** Event Driven
+
+**Requirement:**
+WHEN `mongodb.snapshot.boundary_mode` = `min_max` AND the `_id` field type is `Int32` or `Int64`, the connector SHALL compute integer arithmetic midpoints for the split boundaries.
+
+**Rationale:**
+Integer `_id` values are common in user-defined schemas. Integer arithmetic is straightforward and exact.
+
+**Verification:**
+Unit test: verify Int32 and Int64 splits produce correct evenly-spaced boundaries, including negative ranges.
+
+---
+
+**OPLOG-058:** Unwanted Behaviour
+
+**Requirement:**
+WHEN `mongodb.snapshot.boundary_mode` = `min_max` AND the min and max `_id` values have different BSON types, the connector SHALL fail with an error message that includes guidance to set `mongodb.snapshot.boundary_mode=sample`. The error SHALL be raised at snapshot start, not deferred to a later phase.
+
+**Rationale:**
+Mixed `_id` types cannot be meaningfully split by arithmetic. Failing loudly prevents silent data skew from misinterpreted boundaries.
+
+**Verification:**
+Unit test: verify mixed-type inputs to `compute_synthetic_splits` produce an error containing "sample".
+
+---
+
+**OPLOG-059:** Unwanted Behaviour
+
+**Requirement:**
+WHEN `mongodb.snapshot.boundary_mode` = `min_max` AND the `_id` field type is not ObjectId, Int32, or Int64 (e.g., String, Boolean, Document), the connector SHALL fail with an error message that lists the supported types and includes guidance to set `mongodb.snapshot.boundary_mode=sample`. The error SHALL be raised at snapshot start, not deferred.
+
+**Rationale:**
+Unsupported types cannot be split by arithmetic. Failing loudly at startup ensures operators discover configuration issues immediately rather than encountering subtle runtime failures. This is a design constraint: we only accept `_id` types we can split deterministically.
+
+**Verification:**
+Unit test: verify unsupported same-type inputs produce an error containing "sample". Integration test: verify a collection with String `_id` fails with the expected error in min_max mode.
+
+---
+
+**OPLOG-060:** Event Driven
+
+**Requirement:**
+WHEN `mongodb.snapshot.boundary_mode` = `sample`, the connector SHALL use the existing `$sample` aggregation pipeline (OPLOG-048) with an additional deduplication step: after sorting sampled `_id` values, duplicate IDs SHALL be removed before computing quantile boundaries. The pipeline SHALL NOT use `allowDiskUse`.
+
+**Rationale:**
+MongoDB SERVER-20385 can produce duplicate samples from `$sample`. Deduplication prevents empty chunks caused by identical boundary points. Not using `allowDiskUse` respects the 100MB sort limit, which is acceptable for the bounded sample sizes used (max 100,000).
+
+**Verification:**
+Unit test: verify dedup is applied in the sample pipeline. Integration test: verify sample mode still produces correct boundaries.
+
+---
+
 ## Tradeoff Analysis
 
 ### Why Oplog Tailing vs. Change Streams
@@ -765,3 +997,4 @@ This guarantees that RisingWave only ingests operations that are durable across 
 - **Batched read-back**: For update-heavy workloads, batch `findOne` calls into periodic bulk reads. Collect update `_id` values and issue batched `find({_id: {$in: [...]}})` requests every configurable interval (default: 100ms) or when a maximum batch size is reached (default: 1024). This amortizes round-trip latency across multiple updates (OPLOG-032 optimization).
 - **Change Stream pre/post images**: On MongoDB 6.0+, use `changeStreamPreAndPostImages` collection option to avoid read-back entirely.
 - **MongoDB 3.6 support**: Implemented — using `mongodb` Rust driver v2.8.2 which supports server 3.6+.
+- **Parallel snapshot backfill** (OPLOG-047–052): `workers_per_shard` config (default 1, up to 64) enables reader-internal tokio parallelism for snapshot phase. Uses `$sample`-based boundary discovery (no admin privileges, works on 3.6+), bounded mpsc channel for backpressure, and per-chunk crash recovery via `SnapshotChunkState` in offset. Replay bounded by barrier interval; idempotent via `_id` upsert.

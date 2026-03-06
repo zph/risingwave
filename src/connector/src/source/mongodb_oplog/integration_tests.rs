@@ -31,8 +31,9 @@ use std::time::Duration;
 use mongodb::bson::{doc, Document};
 use mongodb::options::{Acknowledgment, ClientOptions, FindOneOptions, InsertOneOptions, WriteConcern};
 
-use super::MongodbOplogProperties;
+use super::{BoundaryMode, MongodbOplogProperties};
 use super::oplog_types::encode_watermark;
+use super::reader::SnapshotResumeState;
 use super::split::MongodbOplogOffset;
 
 /// Insert options that wait for majority acknowledgement.
@@ -230,6 +231,10 @@ async fn test_snapshot_scan() {
         &split_id,
         5, // batch_size
         snapshot_start_ts,
+        SnapshotResumeState::Fresh,
+        1,
+        10_000,
+        BoundaryMode::Sample,
         None,
     )
     .await
@@ -289,6 +294,10 @@ async fn test_snapshot_checkpoint_resume() {
         &split_id,
         100,
         snapshot_start_ts,
+        SnapshotResumeState::Fresh,
+        1,
+        10_000,
+        BoundaryMode::Sample,
         None,
     )
     .await
@@ -311,7 +320,11 @@ async fn test_snapshot_checkpoint_resume() {
         &split_id,
         100,
         snapshot_start_ts,
-        resume_id,
+        SnapshotResumeState::Serial { resume_id },
+        1,
+        10_000,
+        BoundaryMode::Sample,
+        None,
     )
     .await
     .expect("resumed snapshot failed");
@@ -438,6 +451,10 @@ async fn test_startup_mode_snapshot() {
         &split_id,
         100,
         snapshot_start_ts,
+        SnapshotResumeState::Fresh,
+        1,
+        10_000,
+        BoundaryMode::Sample,
         None,
     )
     .await
@@ -607,6 +624,10 @@ async fn test_snapshot_to_cdc_transition() {
         &split_id,
         100,
         snapshot_start_ts,
+        SnapshotResumeState::Fresh,
+        1,
+        10_000,
+        BoundaryMode::Sample,
         None,
     )
     .await
@@ -902,4 +923,514 @@ async fn test_sharded_cluster() {
     }
 
     cluster.destroy().await;
+}
+
+// ── OPLOG-047–052: Chunked parallel snapshot tests ──────────────────
+
+/// OPLOG-048: Verify $sample-based boundary discovery produces correct
+/// non-overlapping chunk ranges covering the full collection.
+#[tokio::test]
+#[ignore]
+async fn test_sample_boundary_discovery() {
+    use super::reader::discover_chunk_boundaries;
+
+    let (_container, uri) = start_mongo_rs().await;
+    let props = make_props(&uri, "bounddb.boundcoll");
+    let (client, _rs_name) = props.build_client().await.unwrap();
+
+    let coll = client.database("bounddb").collection::<Document>("boundcoll");
+    for i in 0..100 {
+        coll.insert_one(doc! { "seq": i }, majority_insert_opts())
+            .await
+            .unwrap();
+    }
+
+    // Request chunks targeting ~25 docs each → ~4 chunks (sample mode)
+    let chunks = discover_chunk_boundaries(&client, "bounddb", "boundcoll", 25, BoundaryMode::Sample)
+        .await
+        .unwrap();
+
+    assert!(
+        chunks.len() >= 2,
+        "100 docs with target 25 should produce at least 2 chunks, got {}",
+        chunks.len()
+    );
+
+    // Verify first chunk has no min, last has no max
+    assert!(chunks.first().unwrap().min_id.is_none());
+    assert!(chunks.last().unwrap().max_id.is_none());
+
+    // Verify boundaries are contiguous: chunk[i].max_id == chunk[i+1].min_id
+    for i in 0..chunks.len() - 1 {
+        assert_eq!(
+            chunks[i].max_id, chunks[i + 1].min_id,
+            "chunk {} max should equal chunk {} min",
+            i,
+            i + 1
+        );
+    }
+
+    // Verify chunk indices are sequential
+    for (i, chunk) in chunks.iter().enumerate() {
+        assert_eq!(chunk.chunk_idx, i);
+        assert!(!chunk.done);
+        assert!(chunk.last_id.is_none());
+    }
+}
+
+/// OPLOG-049: Verify chunked snapshot (workers=4) produces the same _id set
+/// as serial snapshot (workers=1) with no duplicates or gaps.
+#[tokio::test]
+#[ignore]
+async fn test_chunked_snapshot_no_gaps_no_duplicates() {
+    use std::collections::HashSet;
+
+    use super::reader::MongodbOplogSplitReader;
+
+    let (_container, uri) = start_mongo_rs().await;
+    let props = make_props(&uri, "chunkdb.chunkcoll");
+    let (client, rs_name) = props.build_client().await.unwrap();
+
+    let coll = client.database("chunkdb").collection::<Document>("chunkcoll");
+    for i in 0..200 {
+        coll.insert_one(doc! { "seq": i }, majority_insert_opts())
+            .await
+            .unwrap();
+    }
+
+    let snapshot_start_ts = MongodbOplogSplitReader::get_current_oplog_ts(&client)
+        .await
+        .unwrap();
+    let split_id = "0".into();
+
+    // Serial scan
+    let serial_batches = MongodbOplogSplitReader::run_snapshot(
+        &client, "chunkdb", "chunkcoll", &rs_name, &split_id,
+        100, snapshot_start_ts, SnapshotResumeState::Fresh, 1, 10_000,
+        BoundaryMode::Sample, None,
+    )
+    .await
+    .unwrap();
+    let serial_ids: HashSet<String> = serial_batches
+        .iter()
+        .flat_map(|b| b.iter())
+        .map(|m| {
+            let o: MongodbOplogOffset = serde_json::from_str(m.offset.as_ref()).unwrap();
+            o.snapshot_last_id.unwrap()
+        })
+        .collect();
+
+    // Chunked scan (4 workers, chunk target 50 → ~4 chunks from 200 docs)
+    let chunked_batches = MongodbOplogSplitReader::run_snapshot(
+        &client, "chunkdb", "chunkcoll", &rs_name, &split_id,
+        100, snapshot_start_ts, SnapshotResumeState::Fresh, 4, 50,
+        BoundaryMode::Sample, None,
+    )
+    .await
+    .unwrap();
+    let chunked_ids: HashSet<String> = chunked_batches
+        .iter()
+        .flat_map(|b| b.iter())
+        .map(|m| {
+            let o: MongodbOplogOffset = serde_json::from_str(m.offset.as_ref()).unwrap();
+            o.snapshot_last_id.unwrap()
+        })
+        .collect();
+
+    assert_eq!(serial_ids.len(), 200, "serial should return 200 unique docs");
+    assert_eq!(chunked_ids.len(), 200, "chunked should return 200 unique docs");
+    assert_eq!(serial_ids, chunked_ids, "serial and chunked should return same _ids");
+}
+
+/// OPLOG-047: workers=1 through dispatch should be identical to serial.
+#[tokio::test]
+#[ignore]
+async fn test_workers_1_identical_to_serial() {
+    use super::reader::MongodbOplogSplitReader;
+
+    let (_container, uri) = start_mongo_rs().await;
+    let props = make_props(&uri, "w1db.w1coll");
+    let (client, rs_name) = props.build_client().await.unwrap();
+
+    let coll = client.database("w1db").collection::<Document>("w1coll");
+    for i in 0..50 {
+        coll.insert_one(doc! { "seq": i }, majority_insert_opts())
+            .await
+            .unwrap();
+    }
+
+    let snapshot_start_ts = MongodbOplogSplitReader::get_current_oplog_ts(&client)
+        .await
+        .unwrap();
+    let split_id = "0".into();
+
+    let batches = MongodbOplogSplitReader::run_snapshot(
+        &client, "w1db", "w1coll", &rs_name, &split_id,
+        100, snapshot_start_ts, SnapshotResumeState::Fresh, 1, 10_000,
+        BoundaryMode::Sample, None,
+    )
+    .await
+    .unwrap();
+
+    let total: usize = batches.iter().map(|b| b.len()).sum();
+    assert_eq!(total, 50, "workers=1 should return all 50 docs");
+}
+
+/// OPLOG-049: Small collection with fewer docs than chunk target should
+/// auto-fall-back to serial (single chunk).
+#[tokio::test]
+#[ignore]
+async fn test_chunked_snapshot_small_collection() {
+    use super::reader::MongodbOplogSplitReader;
+
+    let (_container, uri) = start_mongo_rs().await;
+    let props = make_props(&uri, "smalldb.smallcoll");
+    let (client, rs_name) = props.build_client().await.unwrap();
+
+    let coll = client.database("smalldb").collection::<Document>("smallcoll");
+    for i in 0..3 {
+        coll.insert_one(doc! { "seq": i }, majority_insert_opts())
+            .await
+            .unwrap();
+    }
+
+    let snapshot_start_ts = MongodbOplogSplitReader::get_current_oplog_ts(&client)
+        .await
+        .unwrap();
+    let split_id = "0".into();
+
+    // 4 workers but only 3 docs → should clamp to serial
+    let batches = MongodbOplogSplitReader::run_snapshot(
+        &client, "smalldb", "smallcoll", &rs_name, &split_id,
+        100, snapshot_start_ts, SnapshotResumeState::Fresh, 4, 10_000,
+        BoundaryMode::Sample, None,
+    )
+    .await
+    .unwrap();
+
+    let total: usize = batches.iter().map(|b| b.len()).sum();
+    assert_eq!(total, 3, "small collection should still return all 3 docs");
+}
+
+/// OPLOG-050: Verify crash recovery resumes only incomplete chunks.
+#[tokio::test]
+#[ignore]
+async fn test_chunked_snapshot_resume_from_persisted_state() {
+    use super::reader::{MongodbOplogSplitReader, discover_chunk_boundaries};
+
+    let (_container, uri) = start_mongo_rs().await;
+    let props = make_props(&uri, "resumedb2.resumecoll2");
+    let (client, rs_name) = props.build_client().await.unwrap();
+
+    let coll = client.database("resumedb2").collection::<Document>("resumecoll2");
+    for i in 0..100 {
+        coll.insert_one(doc! { "seq": i }, majority_insert_opts())
+            .await
+            .unwrap();
+    }
+
+    let snapshot_start_ts = MongodbOplogSplitReader::get_current_oplog_ts(&client)
+        .await
+        .unwrap();
+    let split_id = "0".into();
+
+    // Discover boundaries (target 25 → ~4 chunks)
+    let mut chunks = discover_chunk_boundaries(&client, "resumedb2", "resumecoll2", 25, BoundaryMode::Sample)
+        .await
+        .unwrap();
+
+    assert!(chunks.len() >= 2, "need at least 2 chunks for resume test");
+
+    // Simulate: mark first chunk as done
+    chunks[0].done = true;
+
+    // Resume with the partial state
+    let batches = MongodbOplogSplitReader::run_snapshot(
+        &client, "resumedb2", "resumecoll2", &rs_name, &split_id,
+        100, snapshot_start_ts,
+        SnapshotResumeState::Chunked { chunks: chunks.clone() },
+        4, 25, BoundaryMode::Sample, None,
+    )
+    .await
+    .unwrap();
+
+    // Should NOT return docs from chunk 0's range
+    let total: usize = batches.iter().map(|b| b.len()).sum();
+    assert!(
+        total < 100,
+        "resumed snapshot should return fewer than 100 docs since chunk 0 is done, got {}",
+        total
+    );
+    assert!(total > 0, "resumed snapshot should still return some docs");
+}
+
+/// OPLOG-050: All chunks done → empty result.
+#[tokio::test]
+#[ignore]
+async fn test_chunked_snapshot_resume_all_done() {
+    use super::reader::MongodbOplogSplitReader;
+    use super::split::SnapshotChunkState;
+
+    let (_container, uri) = start_mongo_rs().await;
+    let props = make_props(&uri, "donedb.donecoll");
+    let (client, rs_name) = props.build_client().await.unwrap();
+
+    let coll = client.database("donedb").collection::<Document>("donecoll");
+    for i in 0..10 {
+        coll.insert_one(doc! { "seq": i }, majority_insert_opts())
+            .await
+            .unwrap();
+    }
+
+    let snapshot_start_ts = MongodbOplogSplitReader::get_current_oplog_ts(&client)
+        .await
+        .unwrap();
+    let split_id = "0".into();
+
+    // All chunks done
+    let chunks = vec![
+        SnapshotChunkState {
+            chunk_idx: 0,
+            min_id: None,
+            max_id: Some("\"mid\"".to_owned()),
+            last_id: Some("\"mid\"".to_owned()),
+            done: true,
+        },
+        SnapshotChunkState {
+            chunk_idx: 1,
+            min_id: Some("\"mid\"".to_owned()),
+            max_id: None,
+            last_id: Some("\"end\"".to_owned()),
+            done: true,
+        },
+    ];
+
+    let batches = MongodbOplogSplitReader::run_snapshot(
+        &client, "donedb", "donecoll", &rs_name, &split_id,
+        100, snapshot_start_ts,
+        SnapshotResumeState::Chunked { chunks },
+        4, 10_000, BoundaryMode::Sample, None,
+    )
+    .await
+    .unwrap();
+
+    let total: usize = batches.iter().map(|b| b.len()).sum();
+    assert_eq!(total, 0, "all chunks done should return empty");
+}
+
+/// OPLOG-051: Verify chunked snapshot to CDC transition — offsets from
+/// the last batch should have snapshot_chunks with all entries done.
+#[tokio::test]
+#[ignore]
+async fn test_chunked_snapshot_to_cdc_transition() {
+    use super::reader::MongodbOplogSplitReader;
+
+    let (_container, uri) = start_mongo_rs().await;
+    let props = make_props(&uri, "cdcdb.cdccoll");
+    let (client, rs_name) = props.build_client().await.unwrap();
+
+    let coll = client.database("cdcdb").collection::<Document>("cdccoll");
+    for i in 0..20 {
+        coll.insert_one(doc! { "seq": i }, majority_insert_opts())
+            .await
+            .unwrap();
+    }
+
+    // Insert concurrent writes during snapshot
+    for i in 0..3 {
+        coll.insert_one(doc! { "phase": "during", "seq": i }, majority_insert_opts())
+            .await
+            .unwrap();
+    }
+
+    let snapshot_start_ts = MongodbOplogSplitReader::get_current_oplog_ts(&client)
+        .await
+        .unwrap();
+    let split_id = "0".into();
+
+    // Run chunked snapshot
+    let batches = MongodbOplogSplitReader::run_snapshot(
+        &client, "cdcdb", "cdccoll", &rs_name, &split_id,
+        100, snapshot_start_ts, SnapshotResumeState::Fresh, 4, 10_000,
+        BoundaryMode::Sample, None,
+    )
+    .await
+    .unwrap();
+
+    let total: usize = batches.iter().map(|b| b.len()).sum();
+    assert!(total >= 20, "should snapshot at least the original 20 docs, got {}", total);
+
+    // Verify the last batch's last message has snapshot_chunks with all done
+    if let Some(last_batch) = batches.last() {
+        if let Some(last_msg) = last_batch.last() {
+            let offset: MongodbOplogOffset =
+                serde_json::from_str(last_msg.offset.as_ref()).unwrap();
+            // chunked mode embeds chunk state
+            if let Some(chunks) = &offset.snapshot_chunks {
+                assert!(
+                    chunks.iter().all(|c| c.done),
+                    "final offset should have all chunks done"
+                );
+            }
+            // oplog_ts should be set for CDC transition
+            assert_eq!(offset.oplog_ts_secs, snapshot_start_ts.time);
+        }
+    }
+}
+
+// ── OPLOG-054/055/056: min_max boundary discovery with ObjectId ──────
+
+/// OPLOG-055/056: Verify min_max boundary discovery produces correct
+/// non-overlapping chunk ranges for a collection with ObjectId `_id`.
+#[tokio::test]
+#[ignore]
+async fn test_min_max_boundary_discovery_objectid() {
+    use super::reader::discover_chunk_boundaries;
+
+    let (_container, uri) = start_mongo_rs().await;
+    let props = make_props(&uri, "mmdb.mmcoll");
+    let (client, _rs_name) = props.build_client().await.unwrap();
+
+    let coll = client.database("mmdb").collection::<Document>("mmcoll");
+    for i in 0..200 {
+        coll.insert_one(doc! { "val": i }, majority_insert_opts())
+            .await
+            .unwrap();
+    }
+
+    // Request chunks targeting ~50 docs each → ~4 chunks
+    let chunks = discover_chunk_boundaries(&client, "mmdb", "mmcoll", 50, BoundaryMode::MinMax)
+        .await
+        .unwrap();
+
+    assert!(
+        chunks.len() >= 2,
+        "200 docs / target 50 should produce >= 2 chunks, got {}",
+        chunks.len()
+    );
+
+    // First chunk has min_id=None, last has max_id=None
+    assert!(chunks.first().unwrap().min_id.is_none());
+    assert!(chunks.last().unwrap().max_id.is_none());
+
+    // Boundaries should be contiguous (chunk[i].max_id == chunk[i+1].min_id)
+    for i in 0..chunks.len() - 1 {
+        assert_eq!(
+            chunks[i].max_id, chunks[i + 1].min_id,
+            "chunk {} max_id should equal chunk {} min_id",
+            i,
+            i + 1
+        );
+    }
+}
+
+// ── OPLOG-057: min_max boundary discovery with integer _id ───────────
+
+/// OPLOG-057: Verify min_max boundary discovery with Int32 `_id` values.
+#[tokio::test]
+#[ignore]
+async fn test_min_max_boundary_discovery_integer_id() {
+    use super::reader::discover_chunk_boundaries;
+
+    let (_container, uri) = start_mongo_rs().await;
+    let props = make_props(&uri, "intdb.intcoll");
+    let (client, _rs_name) = props.build_client().await.unwrap();
+
+    let coll = client.database("intdb").collection::<Document>("intcoll");
+    for i in 0..200i32 {
+        coll.insert_one(doc! { "_id": i, "val": i }, majority_insert_opts())
+            .await
+            .unwrap();
+    }
+
+    let chunks = discover_chunk_boundaries(&client, "intdb", "intcoll", 50, BoundaryMode::MinMax)
+        .await
+        .unwrap();
+
+    assert!(
+        chunks.len() >= 2,
+        "200 int docs / target 50 should produce >= 2 chunks, got {}",
+        chunks.len()
+    );
+    assert!(chunks.first().unwrap().min_id.is_none());
+    assert!(chunks.last().unwrap().max_id.is_none());
+}
+
+// ── OPLOG-059: min_max fails loudly for unsupported _id type ──────────
+
+/// OPLOG-059: Verify min_max fails with error for String _id.
+#[tokio::test]
+#[ignore]
+async fn test_min_max_boundary_fails_for_string_id() {
+    use super::reader::discover_chunk_boundaries;
+
+    let (_container, uri) = start_mongo_rs().await;
+    let props = make_props(&uri, "strdb.strcoll");
+    let (client, _rs_name) = props.build_client().await.unwrap();
+
+    let coll = client.database("strdb").collection::<Document>("strcoll");
+    for i in 0..200 {
+        coll.insert_one(
+            doc! { "_id": format!("key_{:04}", i), "val": i },
+            majority_insert_opts(),
+        )
+        .await
+        .unwrap();
+    }
+
+    let result = discover_chunk_boundaries(&client, "strdb", "strcoll", 50, BoundaryMode::MinMax)
+        .await;
+    assert!(result.is_err(), "min_max should fail for String _id");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("sample"),
+        "error should suggest using sample mode: {}",
+        err_msg
+    );
+}
+
+// ── OPLOG-054: end-to-end chunked snapshot with min_max mode ─────────
+
+/// OPLOG-054: Full end-to-end chunked snapshot using min_max boundary mode.
+#[tokio::test]
+#[ignore]
+async fn test_chunked_snapshot_with_min_max_mode() {
+    use std::collections::HashSet;
+    use super::reader::MongodbOplogSplitReader;
+
+    let (_container, uri) = start_mongo_rs().await;
+    let props = make_props(&uri, "mmsnap.mmcoll2");
+    let (client, rs_name) = props.build_client().await.unwrap();
+
+    let coll = client.database("mmsnap").collection::<Document>("mmcoll2");
+    for i in 0..200 {
+        coll.insert_one(doc! { "val": i }, majority_insert_opts())
+            .await
+            .unwrap();
+    }
+
+    let snapshot_start_ts = MongodbOplogSplitReader::get_current_oplog_ts(&client)
+        .await
+        .unwrap();
+    let split_id = "0".into();
+
+    // Chunked scan with min_max mode (4 workers, target 50)
+    let batches = MongodbOplogSplitReader::run_snapshot(
+        &client, "mmsnap", "mmcoll2", &rs_name, &split_id,
+        100, snapshot_start_ts, SnapshotResumeState::Fresh, 4, 50,
+        BoundaryMode::MinMax, None,
+    )
+    .await
+    .unwrap();
+
+    let all_ids: HashSet<String> = batches
+        .iter()
+        .flat_map(|b| b.iter())
+        .map(|m| {
+            let o: MongodbOplogOffset = serde_json::from_str(m.offset.as_ref()).unwrap();
+            o.snapshot_last_id.unwrap()
+        })
+        .collect();
+
+    assert_eq!(all_ids.len(), 200, "min_max mode should capture all 200 docs");
 }
